@@ -31,17 +31,15 @@ VGG_LAYERS = [
 ]
 
 VGG19_WEIGHTS = {"content":{
-                               "conv3_3": 0.25,
-                               "conv3_4": 0.25,
-                               "conv4_1": 0.25,
-                               "conv4_2": 0.25
+                               #"conv2_1": 0,
+                               "conv3_1": 0
 },
                      "style": {
+                               "conv2_1": 0.2,
+                               "conv2_2": 0.2,
+                               "conv3_1": 0.2,
                                "conv3_2": 0.2,
-                               "conv3_3": 0.2,
-                               "conv3_4": 0.2,
-                               "conv4_1": 0.2,
-                               "conv4_2": 0.2
+                                "conv3_3": 0.2
                                 }}
 
 GOOGLENET_WEIGHTS = {"content":{
@@ -52,7 +50,7 @@ GOOGLENET_WEIGHTS = {"content":{
                                "inception_4a/output": 0.2,
                                "inception_5a/output": 0.2}}
 
-STYLE_SCALE = 1.2
+STYLE_SCALE = 1
 
 def style_optfn(x, net, weights, layers, reprs, ratio):
     """
@@ -235,6 +233,33 @@ class NeuralStyle:
         data = self.net.blobs["data"].data
         img_out = self.transformer.deprocess("data", data)
         return img_out
+
+    def compute_repr_multiple(self, style_imgs, length=512):
+
+        orig_dim = min(self.net.blobs["data"].shape[2:])
+        layers = self.weights["style"].keys()
+
+        G_total = {}
+        for layer in layers:
+            n_filters = np.array(self.net.blobs[layer].data).shape[1]
+            G_total[layer] = np.zeros((n_filters, n_filters), dtype=np.float64)
+        
+        for img_nm in style_imgs:
+            img = caffe.io.load_image(img_nm)
+            scale = max(length / float(max(img.shape[:2])),
+                        orig_dim / float(min(img.shape[:2])))
+            img = rescale(img, STYLE_SCALE * scale)
+
+            self._rescale_net(img)
+            net_in = self.transformer.preprocess("data", img)
+            G = _compute_reprs(net_in, self.net, layers, [],
+                                 gram_scale=1)[0]
+            for layer in G:
+                G_total[layer] += G[layer]
+        for layer in G_total:
+            G_total[layer] /= len(style_imgs)
+        return G_total
+
         
     def transfer_style(self, style_img, content_img, length=512, ratio=1e3,
                        n_iter=512, init="-1", verbose=False, callback=None):
@@ -245,24 +270,26 @@ class NeuralStyle:
 
         #assume the convnet input is a square
         orig_dim = min(self.net.blobs["data"].shape[2:])
-
-        #rescale the style and content images 
-        scale = max(length / float(max(style_img.shape[:2])), 
-                    orig_dim / float(min(style_img.shape[:2])))
-        style_img = rescale(style_img, STYLE_SCALE * scale)
-
+    
+        #rescale the style and content images
         scale = max(length / float(max(content_img.shape[:2])),
                     orig_dim / float(min(content_img.shape[:2])))
         content_img = rescale(content_img, scale)
+
+        if type(style_img) is list:
+            G_style = self.compute_repr_multiple(style_img)
+        else:
+            scale = max(length / float(max(style_img.shape[:2])),
+                    orig_dim / float(min(style_img.shape[:2])))
+            style_img = rescale(style_img, STYLE_SCALE * scale)
         
-        
-        #compute style representations
-        self._rescale_net(style_img)
-        layers = self.weights["style"].keys()
-        net_in = self.transformer.preprocess("data", style_img)
-        gram_scale = float(content_img.size) / style_img.size
-        G_style = _compute_reprs(net_in, self.net, layers, [],
-                                 gram_scale=1)[0] #why do we set gram scale to 1?
+            #compute style representations
+            self._rescale_net(style_img)
+            layers = self.weights["style"].keys()
+            net_in = self.transformer.preprocess("data", style_img)
+            gram_scale = float(content_img.size) / style_img.size
+            G_style = _compute_reprs(net_in, self.net, layers, [],
+                                    gram_scale=1)[0] #why do we set gram scale to 1?
         
         self._rescale_net(content_img)
 
@@ -304,13 +331,7 @@ class NeuralStyle:
         minfn_args["callback"] = self.callback
         n_iters = minimize(style_optfn, img0.flatten(), **minfn_args).nit
 
-
-def main():
-    gpu = int(sys.argv[1])
-
-    caffe.set_device(gpu)
-    caffe.set_mode_gpu()
-
+def simple_transfer(n_iter, ratio):
     style_nm = sys.argv[2]
     style_img = caffe.io.load_image(style_nm)
     style = style_nm.split(".")[0]
@@ -318,15 +339,43 @@ def main():
 
     t = time.time()
     ns = NeuralStyle(model="vgg19")
-    n_iter = 400
-    #for layer in VGG_LAYERS:
-    #    VGG19_WEIGHTS["style"] = {layer: 1}
     ns.init_weights(VGG19_WEIGHTS)
-    ns.transfer_style(style_img, content_img, n_iter=n_iter, init="-1", ratio=1e4)
+    ns.transfer_style(style_img, content_img, n_iter=n_iter, init="-1", ratio=ratio)
     img_out = ns.get_generated()
-    #name = style + "_" + layer + ".jpg"
     name = sys.argv[3]
     imsave(name, img_as_ubyte(img_out))
+
+def multiple_transfer(n_iter, ratio):
+    content_img = caffe.io.load_image(sys.argv[2])
+    if sys.argv[3] == "-d":
+        if sys.argv[4][-1] == '/':
+            prefix = sys.argv[4]
+        else:
+            prefix = sys.argv[4] + "/"
+        style_imgs = map(lambda f: prefix + f, os.listdir(sys.argv[4]))
+    else:
+        style_imgs = sys.argv[3:]
+    ns = NeuralStyle(model="vgg19")
+    ns.init_weights(VGG19_WEIGHTS)
+    ns.transfer_style(style_imgs, content_img, n_iter=n_iter, init="-1", ratio=ratio, length=512)
+    img_out = ns.get_generated()
+    name = "outBig.jpg"
+    imsave(name, img_as_ubyte(img_out))
+
+
+def main():
+    if sys.argv[1] == "-1":
+        caffe.set_mode_cpu()
+    else:
+        gpu = int(sys.argv[1])
+        caffe.set_device(gpu)
+        caffe.set_mode_gpu()
+    n_iter = 400
+    ratio = 1e4
+    t = time.time()
+    multiple_transfer(n_iter, ratio)
+    print "took " + str(time.time() - t) + " s"
+
 
 if __name__ == "__main__":
     main()
