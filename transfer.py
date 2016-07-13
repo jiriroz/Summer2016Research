@@ -31,8 +31,8 @@ VGG_LAYERS = [
 ]
 
 VGG19_WEIGHTS = {"content":{
-                               #"conv2_1": 0,
-                               "conv3_1": 0
+                               "conv2_1": 0.5,
+                               "conv3_1": 0.5
 },
                      "style": {
                                "conv2_1": 0.2,
@@ -51,6 +51,43 @@ GOOGLENET_WEIGHTS = {"content":{
                                "inception_5a/output": 0.2}}
 
 STYLE_SCALE = 1
+
+def readLayerSpecs(specsFile):
+    """
+    A specifications file consists of n lines, each corresponding to one layer.
+    Each line specifies the name of the layer, its contribution,
+    and a variable number of image file names corresponding to the style or
+    content (all separated by spaces).
+
+    @return a dict of the form {layer: [alpha, [image names]], ...]
+    """
+
+    out = []
+    with open(specsFile, "r") as specs:
+        text = specs.read()
+        lines = specs.split("\n")
+        for ln in lines:
+            raw = ln.split(" ")
+            parsed = [raw[0], float(raw[1]), raw[2:]]
+            out.append(parsed)
+    return out
+
+def transferStyleComplex():
+    gpu = int(sys.argv[1])
+    styleFile = sys.argv[2]
+    contentFile = sys.argv[3]
+
+    styleSpecs = readLayerSpecs(styleFile)
+    contentSpecs = readContentSpecs(contentFile)
+
+    ns = NeuralStyle()
+
+    ns.transferStyle(styleSpecs, contentSpecs)
+    
+
+    
+
+
 
 def style_optfn(x, net, weights, layers, reprs, ratio):
     """
@@ -184,7 +221,7 @@ class NeuralStyle:
 
         return x0
 
-    def __init__(self, model="googlenet"):
+    def __init__(self, model="vgg19"):
 
         if model == "vgg19":
             model_file = "models/vgg19/VGG_ILSVRC_19_layers_deploy.prototxt"
@@ -234,31 +271,41 @@ class NeuralStyle:
         img_out = self.transformer.deprocess("data", data)
         return img_out
 
-    def compute_repr_multiple(self, style_imgs, length=512):
+    def compReprAllLayers(self, specsStyle, specsContent, length=512):
+        allLayers = specsStyle.keys() + specsContent.keys()
+        reprsStyle = {}
+        reprsContent = {}
+        
+        for layer in allLayers:
+            if layer in specsContent:
+                
+            if layer in specsStyle:
+                imgs = specsStyle[layer][1]
+                G = self.computeReprOneLayer(layer, imgs, length)
+            reprs[layer] = (alpha, G)
+        return reprs
+
+    def computeReprOneLayer(self, layer, styleImgs, length):
 
         orig_dim = min(self.net.blobs["data"].shape[2:])
-        layers = self.weights["style"].keys()
 
-        G_total = {}
-        for layer in layers:
-            n_filters = np.array(self.net.blobs[layer].data).shape[1]
-            G_total[layer] = np.zeros((n_filters, n_filters), dtype=np.float64)
-        
-        for img_nm in style_imgs:
-            img = caffe.io.load_image(img_nm)
+        n_filters = np.array(self.net.blobs[layer].data).shape[1]
+        G = np.zeros((n_filters, n_filters), dtype=np.float64)
+
+        for name in styleImgs:
+            img = caffe.io.load_image(name)
             scale = max(length / float(max(img.shape[:2])),
                         orig_dim / float(min(img.shape[:2])))
             img = rescale(img, STYLE_SCALE * scale)
 
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
-            G = _compute_reprs(net_in, self.net, layers, [],
+            g = _compute_reprs(net_in, self.net, layers, [],
                                  gram_scale=1)[0]
-            for layer in G:
-                G_total[layer] += G[layer]
-        for layer in G_total:
-            G_total[layer] /= len(style_imgs)
-        return G_total
+            G += g
+
+        G /= len(style_imgs)
+        return G
 
         
     def transfer_style(self, style_img, content_img, length=512, ratio=1e3,
@@ -331,6 +378,12 @@ class NeuralStyle:
         minfn_args["callback"] = self.callback
         n_iters = minimize(style_optfn, img0.flatten(), **minfn_args).nit
 
+    def transferStyle(self, styleSpecs, contentSpecs):
+
+        reprs = self.compReprsAllLayers(styleSpecs)
+        
+
+
 def simple_transfer(n_iter, ratio):
     style_nm = sys.argv[2]
     style_img = caffe.io.load_image(style_nm)
@@ -357,9 +410,9 @@ def multiple_transfer(n_iter, ratio):
         style_imgs = sys.argv[3:]
     ns = NeuralStyle(model="vgg19")
     ns.init_weights(VGG19_WEIGHTS)
-    ns.transfer_style(style_imgs, content_img, n_iter=n_iter, init="-1", ratio=ratio, length=512)
+    ns.transfer_style(style_imgs, content_img, n_iter=n_iter, init="-1", ratio=ratio, length=600)
     img_out = ns.get_generated()
-    name = "outBig.jpg"
+    name = "out" + str(int(time.time())) + ".jpg"
     imsave(name, img_as_ubyte(img_out))
 
 
@@ -370,8 +423,8 @@ def main():
         gpu = int(sys.argv[1])
         caffe.set_device(gpu)
         caffe.set_mode_gpu()
-    n_iter = 400
-    ratio = 1e4
+    n_iter = 500
+    ratio = 1e5
     t = time.time()
     multiple_transfer(n_iter, ratio)
     print "took " + str(time.time() - t) + " s"
