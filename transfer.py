@@ -52,6 +52,19 @@ GOOGLENET_WEIGHTS = {"content":{
 
 STYLE_SCALE = 1
 
+def transferStyleComplex(styleFile, contentFile):
+    styleSpecs, styleContribs = readLayerSpecs(styleFile)
+    contentSpecs, contentContribs = readLayerSpecs(contentFile)
+    contribs = (styleContribs, contentContribs)
+
+    ns = NeuralStyle()
+
+    ns.transferStyle(styleSpecs, contentSpecs, contribs, n_iter=10, ratio=1e4, length=256)
+
+    img_out = ns.get_generated()
+    name = "out" + str(int(time.time())) + ".jpg"
+    imsave(name, img_as_ubyte(img_out))
+
 def readLayerSpecs(specsFile):
     """
     A specifications file consists of n lines, each corresponding to one layer.
@@ -63,30 +76,16 @@ def readLayerSpecs(specsFile):
     """
 
     out = {}
+    outContribs = {}
     with open(specsFile, "r") as specs:
         text = specs.read()
-        lines = specs.split("\n")
+        lines = text.split("\n")
+        lines = lines[:len(lines) - 1]
         for ln in lines:
             raw = ln.split(" ")
-            out[raw[0]] = (float(raw[1]), raw[2:])
-    return out
-
-def transferStyleComplex():
-    gpu = int(sys.argv[1])
-    styleFile = sys.argv[2]
-    contentFile = sys.argv[3]
-
-    styleSpecs = readLayerSpecs(styleFile)
-    contentSpecs = readContentSpecs(contentFile)
-
-    ns = NeuralStyle()
-
-    ns.transferStyle(styleSpecs, contentSpecs)
-    
-
-    
-
-
+            out[raw[0]] = raw[2:]
+            outContribs[raw[0]] = float(raw[1])
+    return out, outContribs
 
 def style_optfn(x, net, weights, layers, reprs, ratio):
     """
@@ -153,19 +152,70 @@ def style_optfn(x, net, weights, layers, reprs, ratio):
 
     return loss, grad
 
-def _compute_style_grad(F, G, G_style, layer):
+def optimizeImage(img, net, contribs, reprs, ratio):
+    """
+    Optimization function for creating the resulting image.
+
+    """
+
+    contrStyle = contribs["style"]
+    contrContent = contribs["content"]
+    layersStyle = contrStyle.keys()
+    layersContent = contrContent.keys()
+
+    net_in = img.reshape(net.blobs["data"].data.shape[1:])
+
+    (G_guide, F_guide) = reprs
+    (G, F) = _compute_reprs(net_in, net, layersStyle, layersContent)
+
+    #backprop by layer
+    loss = 0
+    layers = list(net.blobs)[1:]
+    net.blobs[layers[-1]].diff[:] = 0
+
+    for i, layer in reversed(enumerate(layers)):
+        nextLayer = None if i == len(layers)-1 else layers[-i-2]
+        grad = net.blobs[layer].diff[0]
+
+        #style contribution
+        if layer in layersStyle:
+            contr = contrStyle[layer]
+            (localLoss, localGrad) = _compute_style_grad(F, G, G_guide, layer)
+            loss += contr * localLoss * ratio
+            grad += contr * localGrad.reshape(grad.shape) * ratio
+
+        #content contribution
+        if layer in layersContent:
+            contr = contrContent[layer]
+            (localLoss, localGrad) = _compute_content_grad(F, F_guide, layer)
+            loss += contr * localLoss
+            grad += contr * localGrad.reshape(grad.shape)
+
+        #compute gradient
+        net.backward(start=layer, end=nextLayer)
+        if nextLayer is None:
+            grad = net.blobs["data"].diff[0]
+        else:
+            grad = net.blobs[nextLayer].diff[0]
+
+    #format gradient for minimize() function
+    grad = grad.flatten().astype(np.float64)
+
+    return loss, grad
+
+def _compute_style_grad(F, G, G_guide, layer):
     """Computes style gradient and loss from activation features."""
     (Fl, Gl) = (F[layer], G[layer])
     c = Fl.shape[0]**-2 * Fl.shape[1]**-2
-    El = Gl - G_style[layer]
+    El = Gl - G_guide[layer]
     loss = c/4 * (El**2).sum()
     grad = c * sgemm(1.0, El, Fl) * (Fl>0)
     return loss, grad
 
-def _compute_content_grad(F, F_content, layer):
+def _compute_content_grad(F, F_guide, layer):
     """Computes content gradient and loss from activation features."""
     Fl = F[layer]
-    El = Fl - F_content[layer]
+    El = Fl - F_guide[layer]
     loss = (El**2).sum() / 2
     grad = El * (Fl>0)
     return loss, grad
@@ -270,19 +320,25 @@ class NeuralStyle:
         img_out = self.transformer.deprocess("data", data)
         return img_out
 
-    def compReprAllLayers(self, specsStyle, specsContent, length=512):
+    def compReprAllLayers(self, specsStyle, specsContent, length):
         reprStyle = {}
         reprContent = {}
         
         for layer in set(specsStyle.keys())|set(specsContent.keys()):
-            styleImgs = specsStyle[layer][1]
-            contentImgs = specsContent[layer][1]
+            if layer in specsStyle:
+                styleImgs = specsStyle[layer]
+            else:
+                styleImgs = []
+            if layer in specsContent:
+                contentImgs = specsContent[layer]
+            else:
+                contentImgs = []
             
             G, F = self.computeReprOneLayer(layer, styleImgs, contentImgs, length)
             if layer in specsStyle:
                 reprStyle[layer] = G
             if layer in specsContent:
-                reptContent[layer] = F
+                reprContent[layer] = F
         return reprStyle, reprContent
 
     def computeReprOneLayer(self, layer, styleImgs, contentImgs, length):
@@ -291,7 +347,7 @@ class NeuralStyle:
 
         n_filters = np.array(self.net.blobs[layer].data).shape[1]
         G_res = np.zeros((n_filters, n_filters), dtype=np.float64)
-        F_res = #TODO
+        F_res = np.zeros(self.net.blobs[layer].data[0].shape, dtype=np.float64)
 
         for name in set(styleImgs)|set(contentImgs):
             img = caffe.io.load_image(name)
@@ -303,17 +359,23 @@ class NeuralStyle:
             net_in = self.transformer.preprocess("data", img)
             self.net.blobs["data"].data[0] = net_in
             self.net.forward()
+            #The layer is being resized after the forward pass.
+            #That's why I can't take an avg of multiple imgs.
 
-            F = net.blobs[layer].data[0].copy()
+            F = self.net.blobs[layer].data[0].copy()
             F.shape = (F.shape[0], -1)
             if name in contentImgs:
-                F_res += F
+                F_res = F
             if name in styleImgs:
                 G = sgemm(1, F, F.T)
                 G_res += G
 
-        G_res /= len(styleImgs)
-        F_res /= len(contentImgs)
+        if len(styleImgs) > 0:
+            G_res /= len(styleImgs)
+        #if len(contentImgs) > 0:
+        #    F_res /= len(contentImgs)
+        #Right now supporting only one content img.
+        #TODO: Support multiple content imgs
         return G_res, F_res
 
         
@@ -387,9 +449,10 @@ class NeuralStyle:
         minfn_args["callback"] = self.callback
         n_iters = minimize(style_optfn, img0.flatten(), **minfn_args).nit
 
-    def transferStyle(self, styleSpecs, contentSpecs, init="-1"):
+    def transferStyle(self, styleSpecs, contentSpecs, contrib,
+                      init="-1", n_iter=512, ratio=1e4, length=512):
 
-        reprStyle, reprContent = self.compReprsAllLayers(styleSpecs)
+        reprStyle, reprContent = self.compReprAllLayers(styleSpecs, contentSpecs, length)
 
         if isinstance(init, np.ndarray):
             img0 = self.transformer.preprocess("data", init)
@@ -409,18 +472,18 @@ class NeuralStyle:
                       [(data_min[2], data_max[2])]*(img0.size/3)
 
         # optimization params
-        grad_method = "L-BFGS-B"
-        reprs = (G_style, F_content)
+        optMethod = "L-BFGS-B"
+        reprs = (reprStyle, reprContent)
         minfn_args = {
-            "args": (self.net, self.weights, self.layers, reprs, ratio),
-            "method": grad_method, "jac": True, "bounds": data_bounds,
+            "args": (self.net, contribs, reprs, ratio),
+            "method": optMethod, "jac": True, "bounds": data_bounds,
             "options": {"maxcor": 8, "maxiter": n_iter, "disp": verbose}
         }
 
         #optimize
         self._callback = callback
         minfn_args["callback"] = self.callback
-        n_iters = minimize(style_optfn, img0.flatten(), **minfn_args).nit
+        n_iters = minimize(optimizeImage, img0.flatten(), **minfn_args).nit
 
         
 
@@ -464,11 +527,13 @@ def main():
         gpu = int(sys.argv[1])
         caffe.set_device(gpu)
         caffe.set_mode_gpu()
-    n_iter = 500
-    ratio = 1e5
-    t = time.time()
-    multiple_transfer(n_iter, ratio)
-    print "took " + str(time.time() - t) + " s"
+    #n_iter = 500
+    #ratio = 1e5
+    #t = time.time()
+    #multiple_transfer(n_iter, ratio)
+    styleFile = sys.argv[2]
+    contentFile = sys.argv[3]
+    transferStyleComplex(styleFile, contentFile)
 
 
 if __name__ == "__main__":
