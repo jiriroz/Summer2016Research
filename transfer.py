@@ -62,14 +62,13 @@ def readLayerSpecs(specsFile):
     @return a dict of the form {layer: [alpha, [image names]], ...]
     """
 
-    out = []
+    out = {}
     with open(specsFile, "r") as specs:
         text = specs.read()
         lines = specs.split("\n")
         for ln in lines:
             raw = ln.split(" ")
-            parsed = [raw[0], float(raw[1]), raw[2:]]
-            out.append(parsed)
+            out[raw[0]] = (float(raw[1]), raw[2:])
     return out
 
 def transferStyleComplex():
@@ -272,27 +271,29 @@ class NeuralStyle:
         return img_out
 
     def compReprAllLayers(self, specsStyle, specsContent, length=512):
-        allLayers = specsStyle.keys() + specsContent.keys()
-        reprsStyle = {}
-        reprsContent = {}
+        reprStyle = {}
+        reprContent = {}
         
-        for layer in allLayers:
-            if layer in specsContent:
-                
+        for layer in set(specsStyle.keys())|set(specsContent.keys()):
+            styleImgs = specsStyle[layer][1]
+            contentImgs = specsContent[layer][1]
+            
+            G, F = self.computeReprOneLayer(layer, styleImgs, contentImgs, length)
             if layer in specsStyle:
-                imgs = specsStyle[layer][1]
-                G = self.computeReprOneLayer(layer, imgs, length)
-            reprs[layer] = (alpha, G)
-        return reprs
+                reprStyle[layer] = G
+            if layer in specsContent:
+                reptContent[layer] = F
+        return reprStyle, reprContent
 
-    def computeReprOneLayer(self, layer, styleImgs, length):
+    def computeReprOneLayer(self, layer, styleImgs, contentImgs, length):
 
         orig_dim = min(self.net.blobs["data"].shape[2:])
 
         n_filters = np.array(self.net.blobs[layer].data).shape[1]
-        G = np.zeros((n_filters, n_filters), dtype=np.float64)
+        G_res = np.zeros((n_filters, n_filters), dtype=np.float64)
+        F_res = #TODO
 
-        for name in styleImgs:
+        for name in set(styleImgs)|set(contentImgs):
             img = caffe.io.load_image(name)
             scale = max(length / float(max(img.shape[:2])),
                         orig_dim / float(min(img.shape[:2])))
@@ -300,12 +301,20 @@ class NeuralStyle:
 
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
-            g = _compute_reprs(net_in, self.net, layers, [],
-                                 gram_scale=1)[0]
-            G += g
+            self.net.blobs["data"].data[0] = net_in
+            self.net.forward()
 
-        G /= len(style_imgs)
-        return G
+            F = net.blobs[layer].data[0].copy()
+            F.shape = (F.shape[0], -1)
+            if name in contentImgs:
+                F_res += F
+            if name in styleImgs:
+                G = sgemm(1, F, F.T)
+                G_res += G
+
+        G_res /= len(styleImgs)
+        F_res /= len(contentImgs)
+        return G_res, F_res
 
         
     def transfer_style(self, style_img, content_img, length=512, ratio=1e3,
@@ -378,9 +387,41 @@ class NeuralStyle:
         minfn_args["callback"] = self.callback
         n_iters = minimize(style_optfn, img0.flatten(), **minfn_args).nit
 
-    def transferStyle(self, styleSpecs, contentSpecs):
+    def transferStyle(self, styleSpecs, contentSpecs, init="-1"):
 
-        reprs = self.compReprsAllLayers(styleSpecs)
+        reprStyle, reprContent = self.compReprsAllLayers(styleSpecs)
+
+        if isinstance(init, np.ndarray):
+            img0 = self.transformer.preprocess("data", init)
+        elif init == "content":
+            img0 = self.transformer.preprocess("data", content_img)
+        elif init == "mixed":
+            img0 = 0.95*self.transformer.preprocess("data", content_img) + \
+                   0.05*self.transformer.preprocess("data", style_img)
+        else:
+            img0 = self._make_noise_input(init)
+
+        # compute data bounds
+        data_min = -self.transformer.mean["data"][:,0,0]
+        data_max = data_min + self.transformer.raw_scale["data"]
+        data_bounds = [(data_min[0], data_max[0])]*(img0.size/3) + \
+                      [(data_min[1], data_max[1])]*(img0.size/3) + \
+                      [(data_min[2], data_max[2])]*(img0.size/3)
+
+        # optimization params
+        grad_method = "L-BFGS-B"
+        reprs = (G_style, F_content)
+        minfn_args = {
+            "args": (self.net, self.weights, self.layers, reprs, ratio),
+            "method": grad_method, "jac": True, "bounds": data_bounds,
+            "options": {"maxcor": 8, "maxiter": n_iter, "disp": verbose}
+        }
+
+        #optimize
+        self._callback = callback
+        minfn_args["callback"] = self.callback
+        n_iters = minimize(style_optfn, img0.flatten(), **minfn_args).nit
+
         
 
 
