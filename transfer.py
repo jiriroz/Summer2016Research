@@ -9,6 +9,7 @@ from scipy.misc import imsave
 from scipy.optimize import minimize
 from skimage import img_as_ubyte
 from skimage.transform import rescale
+from skimage.transform import resize
 import time
 
 VGG_LAYERS = [
@@ -59,7 +60,7 @@ def transferStyleComplex(styleFile, contentFile):
 
     ns = NeuralStyle()
 
-    ns.transferStyle(styleSpecs, contentSpecs, contribs, n_iter=10, ratio=1e4, length=256)
+    ns.transferStyle(styleSpecs, contentSpecs, contribs, n_iter=200, ratio=1e4, length=256)
 
     img_out = ns.get_generated()
     name = "out" + str(int(time.time())) + ".jpg"
@@ -320,70 +321,71 @@ class NeuralStyle:
         img_out = self.transformer.deprocess("data", data)
         return img_out
 
-    def compReprAllLayers(self, specsStyle, specsContent, length):
+    def compReprAllImgs(self, specsStyle, specsContent, length):
+
+        #assume the convnet input is a square
+        orig_dim = min(self.net.blobs["data"].shape[2:])
+        imgsStyle = {}
+        imgsContent = {}
+
+        #create a map from images to layers they appear in
+        for layer in specsStyle:
+            for img in specsStyle[layer]:
+                if img not in imgsStyle:
+                    imgsStyle[img] = []
+                imgsStyle[img].append(layer)
+        for layer in specsContent:
+            for img in specsContent[layer]:
+                if img not in imgsContent:
+                    imgsContent[img] = []
+                imgsContent[img].append(layer)
+
         reprStyle = {}
         reprContent = {}
-        
-        for layer in set(specsStyle.keys())|set(specsContent.keys()):
-            if layer in specsStyle:
-                styleImgs = specsStyle[layer]
-            else:
-                styleImgs = []
-            if layer in specsContent:
-                contentImgs = specsContent[layer]
-            else:
-                contentImgs = []
-            
-            G, F = self.computeReprOneLayer(layer, styleImgs, contentImgs, length)
-            if layer in specsStyle:
-                reprStyle[layer] = G
-            if layer in specsContent:
-                reprContent[layer] = F
-        #ad hoc fix content representation (for net scale)
-        content_img = caffe.io.load_image(specsContent[specsContent.keys()[0]][0])
-        self._rescale_net(content_img)
-        net_in = self.transformer.preprocess("data", content_img)
-        _, reprContent = _compute_reprs(net_in, self.net, [], specsContent.keys())
-        return reprStyle, reprContent
 
-    def computeReprOneLayer(self, layer, styleImgs, contentImgs, length):
-
-        orig_dim = min(self.net.blobs["data"].shape[2:])
-
-        n_filters = np.array(self.net.blobs[layer].data).shape[1]
-        G_res = np.zeros((n_filters, n_filters), dtype=np.float64)
-        F_res = np.zeros(self.net.blobs[layer].data[0].shape, dtype=np.float64)
-
-        for name in set(styleImgs)|set(contentImgs):
+        for name in imgsStyle:
             img = caffe.io.load_image(name)
             scale = max(length / float(max(img.shape[:2])),
-                        orig_dim / float(min(img.shape[:2])))
+                    orig_dim / float(min(img.shape[:2])))
             img = rescale(img, STYLE_SCALE * scale)
-
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
-            self.net.blobs["data"].data[0] = net_in
-            self.net.forward()
-            #The layer is being resized after the forward pass.
-            #That's why I can't take an avg of multiple imgs.
+            style, _ = _compute_reprs(net_in, self.net, imgsStyle[name], [])
+            for layer in style:
+                if layer not in reprStyle:
+                    #representation and count (for normalization)
+                    reprStyle[layer] = [style[layer], 1]
+                else:
+                    reprStyle[layer][0] += style[layer]
+                    reprStyle[layer][1] += 1
+        for layer in reprStyle:
+            reprStyle[layer] = reprStyle[layer][0] / reprStyle[layer][1]
 
-            F = self.net.blobs[layer].data[0].copy()
-            F.shape = (F.shape[0], -1)
-            if name in contentImgs:
-                F_res = F
-            if name in styleImgs:
-                G = sgemm(1, F, F.T)
-                G_res += G
+        if len(imgsContent) > 0:
+            #resize everything to match the first image
+            resizeTo = imgsContent.keys()[0]
+            dimContent = caffe.io.load_image(resizeTo).shape
+        for name in imgsContent:
+            img = caffe.io.load_image(name)
+            img = resize(img, dimContent)
+            scale = max(length / float(max(img.shape[:2])),
+                    orig_dim / float(min(img.shape[:2])))
+            img = rescale(img, scale)
+            self._rescale_net(img)
+            net_in = self.transformer.preprocess("data", img)
+            _, content = _compute_reprs(net_in, self.net, [], imgsContent[name])
+            for layer in content:
+                if layer not in reprContent:
+                    #representation and count (for normalization)
+                    reprContent[layer] = [content[layer], 1]
+                else:
+                    reprContent[layer][0] += content[layer]
+                    reprContent[layer][1] += 1
+        for layer in reprContent:
+            reprContent[layer] = reprContent[layer][0] / reprContent[layer][1]
 
-        if len(styleImgs) > 0:
-            G_res /= len(styleImgs)
-        #if len(contentImgs) > 0:
-        #    F_res /= len(contentImgs)
-        #Right now supporting only one content img.
-        #TODO: Support multiple content imgs
-        return G_res, F_res
+        return reprStyle, reprContent
 
-        
     def transfer_style(self, style_img, content_img, length=512, ratio=1e3,
                        n_iter=512, init="-1", verbose=False, callback=None):
         """Tranform style of the style image onto the content image.
@@ -457,7 +459,7 @@ class NeuralStyle:
     def transferStyle(self, styleSpecs, contentSpecs, contribs,
                       init="-1", n_iter=512, ratio=1e4, length=512, callback=None):
 
-        reprStyle, reprContent = self.compReprAllLayers(styleSpecs, contentSpecs, length)
+        reprStyle, reprContent = self.compReprAllImgs(styleSpecs, contentSpecs, length)
 
         if isinstance(init, np.ndarray):
             img0 = self.transformer.preprocess("data", init)
