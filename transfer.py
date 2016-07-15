@@ -55,7 +55,7 @@ STYLE_SCALE = 1
 def transferStyleComplex(styleFile, contentFile):
     styleSpecs, styleContribs = readLayerSpecs(styleFile)
     contentSpecs, contentContribs = readLayerSpecs(contentFile)
-    contribs = (styleContribs, contentContribs)
+    contribs = {"style":styleContribs, "content":contentContribs}
 
     ns = NeuralStyle()
 
@@ -173,7 +173,7 @@ def optimizeImage(img, net, contribs, reprs, ratio):
     layers = list(net.blobs)[1:]
     net.blobs[layers[-1]].diff[:] = 0
 
-    for i, layer in reversed(enumerate(layers)):
+    for i, layer in enumerate(reversed(layers)):
         nextLayer = None if i == len(layers)-1 else layers[-i-2]
         grad = net.blobs[layer].diff[0]
 
@@ -339,6 +339,11 @@ class NeuralStyle:
                 reprStyle[layer] = G
             if layer in specsContent:
                 reprContent[layer] = F
+        #ad hoc fix content representation (for net scale)
+        content_img = caffe.io.load_image(specsContent[specsContent.keys()[0]][0])
+        self._rescale_net(content_img)
+        net_in = self.transformer.preprocess("data", content_img)
+        _, reprContent = _compute_reprs(net_in, self.net, [], specsContent.keys())
         return reprStyle, reprContent
 
     def computeReprOneLayer(self, layer, styleImgs, contentImgs, length):
@@ -449,8 +454,8 @@ class NeuralStyle:
         minfn_args["callback"] = self.callback
         n_iters = minimize(style_optfn, img0.flatten(), **minfn_args).nit
 
-    def transferStyle(self, styleSpecs, contentSpecs, contrib,
-                      init="-1", n_iter=512, ratio=1e4, length=512):
+    def transferStyle(self, styleSpecs, contentSpecs, contribs,
+                      init="-1", n_iter=512, ratio=1e4, length=512, callback=None):
 
         reprStyle, reprContent = self.compReprAllLayers(styleSpecs, contentSpecs, length)
 
@@ -477,7 +482,7 @@ class NeuralStyle:
         minfn_args = {
             "args": (self.net, contribs, reprs, ratio),
             "method": optMethod, "jac": True, "bounds": data_bounds,
-            "options": {"maxcor": 8, "maxiter": n_iter, "disp": verbose}
+            "options": {"maxcor": 8, "maxiter": n_iter, "disp": False}
         }
 
         #optimize
