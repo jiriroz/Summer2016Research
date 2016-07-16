@@ -32,15 +32,10 @@ VGG_LAYERS = [
 ]
 
 VGG19_WEIGHTS = {"content":{
-                               "conv2_1": 0.5,
-                               "conv3_1": 0.5
+                               "conv4_1": 1
 },
                      "style": {
-                               "conv2_1": 0.2,
-                               "conv2_2": 0.2,
-                               "conv3_1": 0.2,
-                               "conv3_2": 0.2,
-                                "conv3_3": 0.2
+                               "conv3_1": 1
                                 }}
 
 GOOGLENET_WEIGHTS = {"content":{
@@ -53,14 +48,14 @@ GOOGLENET_WEIGHTS = {"content":{
 
 STYLE_SCALE = 1
 
-def transferStyleComplex(styleFile, contentFile):
+def transferStyleComplex(styleFile, contentFile, n_iter, ratio):
     styleSpecs, styleContribs = readLayerSpecs(styleFile)
     contentSpecs, contentContribs = readLayerSpecs(contentFile)
     contribs = {"style":styleContribs, "content":contentContribs}
 
     ns = NeuralStyle()
 
-    ns.transferStyle(styleSpecs, contentSpecs, contribs, n_iter=200, ratio=1e4, length=256)
+    ns.transferStyle(styleSpecs, contentSpecs, contribs, n_iter=n_iter, ratio=ratio, length=600)
 
     img_out = ns.get_generated()
     name = "out" + str(int(time.time())) + ".jpg"
@@ -414,7 +409,7 @@ class NeuralStyle:
             net_in = self.transformer.preprocess("data", style_img)
             gram_scale = float(content_img.size) / style_img.size
             G_style = _compute_reprs(net_in, self.net, layers, [],
-                                    gram_scale=1)[0] #why do we set gram scale to 1?
+                                    gram_scale=1)[0]
         
         self._rescale_net(content_img)
 
@@ -506,7 +501,7 @@ def simple_transfer(n_iter, ratio):
     ns.init_weights(VGG19_WEIGHTS)
     ns.transfer_style(style_img, content_img, n_iter=n_iter, init="-1", ratio=ratio)
     img_out = ns.get_generated()
-    name = sys.argv[3]
+    name = "out" + str(int(time.time())) + ".jpg"
     imsave(name, img_as_ubyte(img_out))
 
 def multiple_transfer(n_iter, ratio):
@@ -534,13 +529,13 @@ def main():
         gpu = int(sys.argv[1])
         caffe.set_device(gpu)
         caffe.set_mode_gpu()
-    #n_iter = 500
-    #ratio = 1e5
-    #t = time.time()
-    #multiple_transfer(n_iter, ratio)
+    n_iter = 400
+    ratio = 1e3
+    t = time.time()
+    #simple_transfer(n_iter, ratio)
     styleFile = sys.argv[2]
     contentFile = sys.argv[3]
-    transferStyleComplex(styleFile, contentFile)
+    transferStyleComplex(styleFile, contentFile, n_iter, ratio)
 
 
 if __name__ == "__main__":
