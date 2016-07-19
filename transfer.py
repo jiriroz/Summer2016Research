@@ -31,22 +31,7 @@ VGG_LAYERS = [
 "conv5_4"
 ]
 
-VGG19_WEIGHTS = {"content":{
-                               "conv4_1": 1
-},
-                     "style": {
-                               "conv3_1": 1
-                                }}
-
-GOOGLENET_WEIGHTS = {"content":{
-                                 "conv2/3x3": 1},
-                     "style": {"conv1/7x7_s2": 0.2,
-                               "conv2/3x3": 0.2,
-                               "inception_3a/output": 0.2,
-                               "inception_4a/output": 0.2,
-                               "inception_5a/output": 0.2}}
-
-STYLE_SCALE = 1
+STYLE_SCALE = 1.4
 
 def transferStyleComplex(styleFile, contentFile, n_iter, ratio):
     styleSpecs, styleContribs = readLayerSpecs(styleFile)
@@ -82,71 +67,6 @@ def readLayerSpecs(specsFile):
             out[raw[0]] = raw[2:]
             outContribs[raw[0]] = float(raw[1])
     return out, outContribs
-
-def style_optfn(x, net, weights, layers, reprs, ratio):
-    """
-        Style transfer optimization callback for scipy.optimize.minimize().
-
-        :param numpy.ndarray x:
-            Flattened data array.
-
-        :param caffe.Net net:
-            Network to use to generate gradients.
-
-        :param dict weights:
-            Weights to use in the network.
-
-        :param list layers:
-            Layers to use in the network.
-
-        :param tuple reprs:
-            Representation matrices packed in a tuple.
-
-        :param float ratio:
-            Style-to-content ratio.
-    """
-
-    #update params
-    layers_style = weights["style"].keys()
-    layers_content = weights["content"].keys()
-    net_in = x.reshape(net.blobs["data"].data.shape[1:])
-
-    #compute representations
-    (G_style, F_content) = reprs
-    (G, F) = _compute_reprs(net_in, net, layers_style, layers_content)
-
-    #backprop by layer
-    loss = 0
-    net.blobs[layers[-1]].diff[:] = 0
-    for i, layer in enumerate(reversed(layers)):
-        next_layer = None if i == len(layers)-1 else layers[-i-2]
-        grad = net.blobs[layer].diff[0]
-
-        #style contribution
-        if layer in layers_style:
-            wl = weights["style"][layer]
-            (l, g) = _compute_style_grad(F, G, G_style, layer)
-            loss += wl * l * ratio
-            grad += wl * g.reshape(grad.shape) * ratio
-
-        #content contribution
-        if layer in layers_content:
-            wl = weights["content"][layer]
-            (l, g) = _compute_content_grad(F, F_content, layer)
-            loss += wl * l
-            grad += wl * g.reshape(grad.shape)
-
-        #compute gradient
-        net.backward(start=layer, end=next_layer)
-        if next_layer is None:
-            grad = net.blobs["data"].diff[0]
-        else:
-            grad = net.blobs[next_layer].diff[0]
-
-    #format gradient for minimize() function
-    grad = grad.flatten().astype(np.float64)
-
-    return loss, grad
 
 def optimizeImage(img, net, contribs, reprs, ratio):
     """
@@ -487,41 +407,6 @@ class NeuralStyle:
         minfn_args["callback"] = self.callback
         n_iters = minimize(optimizeImage, img0.flatten(), **minfn_args).nit
 
-        
-
-
-def simple_transfer(n_iter, ratio):
-    style_nm = sys.argv[2]
-    style_img = caffe.io.load_image(style_nm)
-    style = style_nm.split(".")[0]
-    content_img = caffe.io.load_image(sys.argv[3])
-
-    t = time.time()
-    ns = NeuralStyle(model="vgg19")
-    ns.init_weights(VGG19_WEIGHTS)
-    ns.transfer_style(style_img, content_img, n_iter=n_iter, init="-1", ratio=ratio)
-    img_out = ns.get_generated()
-    name = "out" + str(int(time.time())) + ".jpg"
-    imsave(name, img_as_ubyte(img_out))
-
-def multiple_transfer(n_iter, ratio):
-    content_img = caffe.io.load_image(sys.argv[2])
-    if sys.argv[3] == "-d":
-        if sys.argv[4][-1] == '/':
-            prefix = sys.argv[4]
-        else:
-            prefix = sys.argv[4] + "/"
-        style_imgs = map(lambda f: prefix + f, os.listdir(sys.argv[4]))
-    else:
-        style_imgs = sys.argv[3:]
-    ns = NeuralStyle(model="vgg19")
-    ns.init_weights(VGG19_WEIGHTS)
-    ns.transfer_style(style_imgs, content_img, n_iter=n_iter, init="-1", ratio=ratio, length=600)
-    img_out = ns.get_generated()
-    name = "out" + str(int(time.time())) + ".jpg"
-    imsave(name, img_as_ubyte(img_out))
-
-
 def main():
     if sys.argv[1] == "-1":
         caffe.set_mode_cpu()
@@ -532,7 +417,6 @@ def main():
     n_iter = 400
     ratio = 1e3
     t = time.time()
-    #simple_transfer(n_iter, ratio)
     styleFile = sys.argv[2]
     contentFile = sys.argv[3]
     transferStyleComplex(styleFile, contentFile, n_iter, ratio)
