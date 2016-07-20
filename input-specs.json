@@ -1,0 +1,22 @@
+{
+"style":{
+    "conv1_1":[
+            ["img1.jpg", "img2.jpg", "img3.jpg"],
+            [0.3, 0.2, 0.5] contributions of each image
+            ]
+        ,
+    "conv2_2":[
+            ["img3.jpg", "img2.jpg"], contributions uniformly distributed
+            0.3 contribution of the layer (last element in the list). If omitted, computed uniformly.
+            ]
+        },
+"content":{
+    "conv2_2":[
+            ["img3.jpg"]
+            ]
+        },
+"ratio":1e4,
+"length":512,
+"iters":400,
+"styleScale":1.4
+}
