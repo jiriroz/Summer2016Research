@@ -293,15 +293,19 @@ class NeuralStyle:
 
         #create a map from images to layers they appear in
         for layer in specsStyle:
-            for img in specsStyle[layer][0]:
+            for i in range(len(specsStyle[layer][0])):
+                img = specsStyle[layer][0][i]
+                contr = specsStyle[layer][1][i]
                 if img not in imgsStyle:
                     imgsStyle[img] = []
-                imgsStyle[img].append(layer)
+                imgsStyle[img].append((layer, contr))
         for layer in specsContent:
-            for img in specsContent[layer][0]:
+            for i in range(len(specsContent[layer][0])):
+                img = specsContent[layer][0][i]
+                contr = specsContent[layer][1][i]
                 if img not in imgsContent:
                     imgsContent[img] = []
-                imgsContent[img].append(layer)
+                imgsContent[img].append((layer, contr))
 
         reprStyle = {}
         reprContent = {}
@@ -314,15 +318,19 @@ class NeuralStyle:
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
             style, _ = _compute_reprs(net_in, self.net, imgsStyle[name], [])
-            for layer in style:
+            #for layer in style: #not weighted
+            for (layer, contr) in style: #weighted
                 if layer not in reprStyle:
-                    #representation and count (for normalization)
-                    reprStyle[layer] = [style[layer], 1]
+                    #representation and count (for normalization) when not weighted
+                    #reprStyle[layer] = [style[layer], 1] #not weighted
+                    reprStyle[layer] = contr * style[layer]
                 else:
-                    reprStyle[layer][0] += style[layer]
-                    reprStyle[layer][1] += 1
-        for layer in reprStyle:
-            reprStyle[layer] = reprStyle[layer][0] / reprStyle[layer][1]
+                    #reprStyle[layer][0] += style[layer] #not weighted
+                    #reprStyle[layer][1] += 1 #not weighted
+                    reprStyle[layer] += contr * style[layer] #weighted
+
+        #for layer in reprStyle: #weighted
+        #    reprStyle[layer] = reprStyle[layer][0] / reprStyle[layer][1]
 
         if len(imgsContent) > 0:
             #resize everything to match the first image
@@ -337,15 +345,18 @@ class NeuralStyle:
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
             _, content = _compute_reprs(net_in, self.net, [], imgsContent[name])
-            for layer in content:
+            #for layer in content: #not weighted
+            for (layer, contr) in content: #weighted
                 if layer not in reprContent:
-                    #representation and count (for normalization)
-                    reprContent[layer] = [content[layer], 1]
+                    #representation and count (for normalization) when not weighted
+                    #reprContent[layer] = [content[layer], 1] #not weighted
+                    reprContent[layer] = contr * content[layer] #weighted
                 else:
-                    reprContent[layer][0] += content[layer]
-                    reprContent[layer][1] += 1
-        for layer in reprContent:
-            reprContent[layer] = reprContent[layer][0] / reprContent[layer][1]
+                    #reprContent[layer][0] += content[layer] #not weighted
+                    #reprContent[layer][1] += 1 #not weighted
+                    reprContent[layer] += contr * content[layer] #weighted
+        #for layer in reprContent: #weighted
+        #    reprContent[layer] = reprContent[layer][0] / reprContent[layer][1]
 
         return reprStyle, reprContent
 
