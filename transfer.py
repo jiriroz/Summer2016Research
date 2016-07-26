@@ -32,6 +32,13 @@ VGG_LAYERS = [
 "conv5_4"
 ]
 
+DEFAULTS = {
+    "length":512,
+    "ratio":1e4,
+    "iters":400,
+    "styleScale":1
+}
+
 def transferStyleComplex(inFile, init="-1"):
     specs = readJsonInput(inFile)
     
@@ -50,9 +57,10 @@ def transferStyleComplex(inFile, init="-1"):
     name = "out" + str(int(time.time())) + ".jpg"
     imsave(name, img_as_ubyte(img_out))
 
-def readLayerSpecs(specsFile):
+def readJsonInput(jsonFile):
     """
-    A specification file is a JSON file. Parateters of the corresponding object:
+    Parses a specifications file, which is a JSON file, and fills in missing values.
+    Parateters of the specs file:
     @style
     @content
     @length
@@ -60,22 +68,8 @@ def readLayerSpecs(specsFile):
     @iters
     @styleScale
 
-    @return a tuple 
+    @return specifications dict where keys are parameters.
     """
-
-    out = {}
-    outContribs = {}
-    with open(specsFile, "r") as specs:
-        text = specs.read()
-        lines = text.split("\n")
-        lines = lines[:len(lines) - 1]
-        for ln in lines:
-            raw = ln.split(" ")
-            out[raw[0]] = raw[2:]
-            outContribs[raw[0]] = float(raw[1])
-    return out, outContribs
-
-def readJsonInput(jsonFile):
     with open(jsonFile, "r") as f:
         raw = f.read()
     specs = json.loads(raw)
@@ -96,6 +90,12 @@ def readJsonInput(jsonFile):
 
     specs["style"] = [style, styleLayerContribs]
     specs["content"] = [content, contentLayerContribs]
+
+    #load default values if not present
+    for value in DEFAULTS:
+        if value not in specs:
+            specs[value] = DEFAULTS[value]
+
     return specs
 
 def optimizeImage(img, net, contribs, reprs, ratio):
