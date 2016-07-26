@@ -7,26 +7,11 @@ var options = {
     mode: 'text'
 }
 
-var pyshell = new PythonShell('track.py', options);
-
-var coords = [];
-var win = [];
+var pyshell = new PythonShell('transferFromServer.py', options);
 
 pyshell.on('message', function (message) {
     var data = message.split(" ");
-    if (data[0] == "C") {
-        var X = parseInt(data[1]);
-        var Y = parseInt(data[2]);
-        var Z = parseInt(data[3]);
-        coords.push([X,Y,Z]);
-    } else if (data[0] == "W") {
-        win = [parseInt(data[1]),
-               parseInt(data[2]),
-               parseInt(data[3]),
-               parseInt(data[4])];
-    } else {
-        console.log(data);
-    }
+    console.log(data);
 });
 
 /*
@@ -63,11 +48,8 @@ http.createServer(function (request, response) {
             pyshell.send(body);
         });
         response.writeHead(200, {"Content-Type": "application/json"});
-        var tosend = {"coords":coords, "win":win};
         response.write(JSON.stringify(tosend));
         response.end("");
-        coords = [];
-        win = [];
     }
 
 }).listen(8000);
