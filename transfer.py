@@ -39,7 +39,7 @@ DEFAULTS = {
     "styleScale":1
 }
 
-def transferStyleComplex(inFile, init="-1"):
+def _transferStyleComplex(inFile, init="-1"):
     specs = readJsonInput(inFile)
     
     layers = {"style":specs["style"][0], "content":specs["content"][0]}
@@ -52,6 +52,24 @@ def transferStyleComplex(inFile, init="-1"):
     ns = NeuralStyle()
 
     ns.transferStyle(layers, contribs, n_iter=iters, ratio=ratio, length=length, styleScale=styleScale, init=init)
+
+    img_out = ns.get_generated()
+    name = "out" + str(int(time.time())) + ".jpg"
+    imsave(name, img_as_ubyte(img_out))
+
+def transferStyleComplex(inFile, init="-1"):
+    specs = readJsonInput(inFile)
+
+    #layers = {"style":specs["style"][0], "content":specs["content"][0]}
+    #contribs = {"style":specs["style"][1], "content":specs["content"][1]}
+    length = specs["length"]
+    ratio = specs["ratio"]
+    iters = specs["iters"]
+    styleScale = specs["styleScale"]
+
+    ns = NeuralStyle()
+
+    ns.transferStyle(specs, n_iter=iters, ratio=ratio, length=length, styleScale=styleScale, init=init)
 
     img_out = ns.get_generated()
     name = "out" + str(int(time.time())) + ".jpg"
@@ -74,6 +92,7 @@ def readJsonInput(jsonFile):
         raw = f.read()
     specs = json.loads(raw)
 
+    """
     style = {}
     content = {}
     styleLayerContribs = {}
@@ -90,6 +109,26 @@ def readJsonInput(jsonFile):
 
     specs["style"] = [style, styleLayerContribs]
     specs["content"] = [content, contentLayerContribs]
+    """
+
+    #If contributions for individial images not given, make them uniform
+    #If a weight for a layer not given, make it uniform.
+    #TODO: Consider normalizing weights/contribs
+    nLayers = len(specs["style"])
+    for layer in specs["style"]:
+        if "weight" not in specs["style"][layer]:
+            specs["style"][layer]["weight"] = 1.0 / nLayers
+        if "contributions" not in specs["style"][layer]:
+            n = len(specs["style"][layer]["images"])
+            specs["style"][layer]["contributions"] = [1.0/n] * n
+
+    nLayers = len(specs["content"])
+    for layer in specs["content"]:
+        if "weight" not in specs["content"][layer]:
+            specs["content"][layer]["weight"] = 1.0 / nLayers
+        if "contributions" not in specs["content"][layer]:
+            n = len(specs["content"][layer]["images"])
+            specs["content"][layer]["contributions"] = [1.0/n] * n
 
     #load default values if not present
     for value in DEFAULTS:
@@ -101,7 +140,6 @@ def readJsonInput(jsonFile):
 def optimizeImage(img, net, contribs, reprs, ratio):
     """
     Optimization function for creating the resulting image.
-
     """
 
     contrStyle = contribs["style"]
@@ -125,14 +163,14 @@ def optimizeImage(img, net, contribs, reprs, ratio):
 
         #style contribution
         if layer in layersStyle:
-            contr = contrStyle[layer]
+            contr = contrStyle[layer]["weight"]
             (localLoss, localGrad) = _compute_style_grad(F, G, G_guide, layer)
             loss += contr * localLoss * ratio
             grad += contr * localGrad.reshape(grad.shape) * ratio
 
         #content contribution
         if layer in layersContent:
-            contr = contrContent[layer]
+            contr = contrContent[layer]["weight"]
             (localLoss, localGrad) = _compute_content_grad(F, F_guide, layer)
             loss += contr * localLoss
             grad += contr * localGrad.reshape(grad.shape)
@@ -275,16 +313,18 @@ class NeuralStyle:
 
         #create a map from images to layers they appear in
         for layer in specsStyle:
-            for i in range(len(specsStyle[layer][0])):
-                img = specsStyle[layer][0][i]
-                contr = specsStyle[layer][1][i]
+            for i in range(len(specsStyle[layer]["images"])):
+                #iterate over every image for that layer
+                img = specsStyle[layer]["images"][i]
+                contr = specsStyle[layer]["contributions"][i]
                 if img not in imgsStyle:
                     imgsStyle[img] = []
                 imgsStyle[img].append((layer, contr))
         for layer in specsContent:
-            for i in range(len(specsContent[layer][0])):
-                img = specsContent[layer][0][i]
-                contr = specsContent[layer][1][i]
+            for i in range(len(specsContent[layer]["images"])):
+                #iterate over every image for that layer
+                img = specsContent[layer]["images"][i]
+                contr = specsContent[layer]["contributions"][i]
                 if img not in imgsContent:
                     imgsContent[img] = []
                 imgsContent[img].append((layer, contr))
@@ -329,7 +369,7 @@ class NeuralStyle:
 
         return reprStyle, reprContent
 
-    def transferStyle(self, layers, contribs, init="-1", n_iter=512,
+    def _transferStyle(self, layers, contribs, init="-1", n_iter=512,
                       ratio=1e4, length=512, callback=None, styleScale=1):
 
         reprStyle, reprContent = self.compReprAllImgs(layers["style"], layers["content"], length, styleScale)
@@ -364,6 +404,44 @@ class NeuralStyle:
         self._callback = callback
         minfn_args["callback"] = self.callback
         n_iters = minimize(optimizeImage, img0.flatten(), **minfn_args).nit
+
+    def transferStyle(self, specs, init="-1", n_iter=512,
+                      ratio=1e4, length=512, callback=None, styleScale=1):
+
+        reprStyle, reprContent = self.compReprAllImgs(specs["style"], specs["content"], length, styleScale)
+
+        if isinstance(init, np.ndarray):
+            img0 = self.transformer.preprocess("data", init)
+        elif init == "content":
+            img0 = self.transformer.preprocess("data", content_img)
+        elif init == "mixed":
+            #TODO fix name
+            img0 = 0.95*self.transformer.preprocess("data", content_img) + \
+                   0.05*self.transformer.preprocess("data", style_img)
+        else:
+            img0 = self._make_noise_input(init)
+
+        # compute data bounds
+        data_min = -self.transformer.mean["data"][:,0,0]
+        data_max = data_min + self.transformer.raw_scale["data"]
+        data_bounds = [(data_min[0], data_max[0])]*(img0.size/3) + \
+                      [(data_min[1], data_max[1])]*(img0.size/3) + \
+                      [(data_min[2], data_max[2])]*(img0.size/3)
+
+        # optimization params
+        optMethod = "L-BFGS-B"
+        reprs = (reprStyle, reprContent)
+        minfn_args = {
+            "args": (self.net, specs, reprs, ratio),
+            "method": optMethod, "jac": True, "bounds": data_bounds,
+            "options": {"maxcor": 8, "maxiter": n_iter, "disp": False}
+        }
+
+        #optimize
+        self._callback = callback
+        minfn_args["callback"] = self.callback
+        n_iters = minimize(optimizeImage, img0.flatten(), **minfn_args).nit
+
 
 def main():
     if sys.argv[1] == "-1":
