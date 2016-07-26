@@ -32,28 +32,11 @@ VGG_LAYERS = [
 "conv5_4"
 ]
 
-STYLE_SCALE = 1.2
-
-def _transferStyleComplex(styleFile, contentFile, n_iter, ratio):
-    styleSpecs, styleContribs = readLayerSpecs(styleFile)
-    contentSpecs, contentContribs = readLayerSpecs(contentFile)
-    contribs = {"style":styleContribs, "content":contentContribs}
-
-    ns = NeuralStyle()
-
-    ns.transferStyle(styleSpecs, contentSpecs, contribs, n_iter=n_iter, ratio=ratio, length=600)
-
-    img_out = ns.get_generated()
-    name = "out" + str(int(time.time())) + ".jpg"
-    imsave(name, img_as_ubyte(img_out))
-
-def transferStyleComplex(inFile):
+def transferStyleComplex(inFile, init="-1"):
     specs = readJsonInput(inFile)
     
     layers = {"style":specs["style"][0], "content":specs["content"][0]}
     contribs = {"style":specs["style"][1], "content":specs["content"][1]}
-    print layers
-    print contribs
     length = specs["length"]
     ratio = specs["ratio"]
     iters = specs["iters"]
@@ -61,8 +44,7 @@ def transferStyleComplex(inFile):
 
     ns = NeuralStyle()
 
-    ns.transferStyle(layers, contribs, n_iter=iters, ratio=ratio, length=length, styleScale=styleScale)
-    return
+    ns.transferStyle(layers, contribs, n_iter=iters, ratio=ratio, length=length, styleScale=styleScale, init=init)
 
     img_out = ns.get_generated()
     name = "out" + str(int(time.time())) + ".jpg"
@@ -70,12 +52,15 @@ def transferStyleComplex(inFile):
 
 def readLayerSpecs(specsFile):
     """
-    A specifications file consists of n lines, each corresponding to one layer.
-    Each line specifies the name of the layer, its contribution,
-    and a variable number of image file names corresponding to the style or
-    content (all separated by spaces).
+    A specification file is a JSON file. Parateters of the corresponding object:
+    @style
+    @content
+    @length
+    @ratio
+    @iters
+    @styleScale
 
-    @return a dict of the form {layer: [alpha, [image names]], ...]
+    @return a tuple 
     """
 
     out = {}
@@ -181,17 +166,18 @@ def _compute_content_grad(F, F_guide, layer):
     grad = El * (Fl>0)
     return loss, grad
 
-def _compute_reprs(net_input, net, layers_style, layers_content, gram_scale=1):
+def _compute_reprs(net_input, net, layersStyle, layersContent, gram_scale=1):
     """Computes representation matrices for an image."""
+
     (repr_style, repr_content) = ({}, {})
     net.blobs["data"].data[0] = net_input
     net.forward()
 
-    for layer in set(layers_style)|set(layers_content):
+    for layer in set(layersStyle)|set(layersContent):
         F = net.blobs[layer].data[0].copy()
         F.shape = (F.shape[0], -1)
         repr_content[layer] = F
-        if layer in layers_style:
+        if layer in layersStyle:
             repr_style[layer] = sgemm(gram_scale, F, F.T)
     return repr_style, repr_content
 
@@ -284,10 +270,6 @@ class NeuralStyle:
     def compReprAllImgs(self, specsStyle, specsContent, length, styleScale):
         #assume the convnet input is a square
         orig_dim = min(self.net.blobs["data"].shape[2:])
-        #specsStyleImgs = specsStyle[0]
-        #specsContentImgs = specsContent[0]
-        #styleImgContribs = specsStyle[1]
-        #contentImgContribs = specsContent[1]
         imgsStyle = {}
         imgsContent = {}
 
@@ -317,20 +299,13 @@ class NeuralStyle:
             img = rescale(img, styleScale * scale)
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
-            style, _ = _compute_reprs(net_in, self.net, imgsStyle[name], [])
-            #for layer in style: #not weighted
-            for (layer, contr) in style: #weighted
+            layersStyle = [x[0] for x in imgsStyle[name]]
+            style, _ = _compute_reprs(net_in, self.net, layersStyle, [])
+            for (layer, contr) in imgsStyle[name]:
                 if layer not in reprStyle:
-                    #representation and count (for normalization) when not weighted
-                    #reprStyle[layer] = [style[layer], 1] #not weighted
                     reprStyle[layer] = contr * style[layer]
                 else:
-                    #reprStyle[layer][0] += style[layer] #not weighted
-                    #reprStyle[layer][1] += 1 #not weighted
-                    reprStyle[layer] += contr * style[layer] #weighted
-
-        #for layer in reprStyle: #weighted
-        #    reprStyle[layer] = reprStyle[layer][0] / reprStyle[layer][1]
+                    reprStyle[layer] += contr * style[layer]
 
         if len(imgsContent) > 0:
             #resize everything to match the first image
@@ -344,19 +319,13 @@ class NeuralStyle:
             img = rescale(img, scale)
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
-            _, content = _compute_reprs(net_in, self.net, [], imgsContent[name])
-            #for layer in content: #not weighted
-            for (layer, contr) in content: #weighted
+            layersContent = [x[0] for x in imgsContent[name]]
+            _, content = _compute_reprs(net_in, self.net, [], layersContent)
+            for (layer, contr) in imgsContent[name]:
                 if layer not in reprContent:
-                    #representation and count (for normalization) when not weighted
-                    #reprContent[layer] = [content[layer], 1] #not weighted
-                    reprContent[layer] = contr * content[layer] #weighted
+                    reprContent[layer] = contr * content[layer]
                 else:
-                    #reprContent[layer][0] += content[layer] #not weighted
-                    #reprContent[layer][1] += 1 #not weighted
-                    reprContent[layer] += contr * content[layer] #weighted
-        #for layer in reprContent: #weighted
-        #    reprContent[layer] = reprContent[layer][0] / reprContent[layer][1]
+                    reprContent[layer] += contr * content[layer]
 
         return reprStyle, reprContent
 
@@ -391,7 +360,6 @@ class NeuralStyle:
             "options": {"maxcor": 8, "maxiter": n_iter, "disp": False}
         }
 
-        return
         #optimize
         self._callback = callback
         minfn_args["callback"] = self.callback
@@ -407,11 +375,13 @@ def main():
     n_iter = 400
     ratio = 1e3
     t = time.time()
-    #styleFile = sys.argv[2]
-    #contentFile = sys.argv[3]
-    #transferStyleComplex(styleFile, contentFile, n_iter, ratio)
     infile = sys.argv[2]
-    transferStyleComplex(infile)
+    if len(sys.argv) > 3:
+        initImg = sys.argv[3]
+        init = caffe.io.load_image(initImg)
+    else:
+        init = "-1"
+    transferStyleComplex(infile, init=init)
 
 
 if __name__ == "__main__":
