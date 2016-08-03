@@ -20,7 +20,7 @@ class SimpleNet:
         pretrained_file = "models/vgg19/VGG_ILSVRC_19_layers.caffemodel"
         mean = np.array([103.939, 116.779, 123.68])
 
-        self.load_model(model_file, pretrained_file, mean)
+        self._load_model(model_file, pretrained_file, mean)
 
         def callback(xk):
             if self._callback is not None:
@@ -28,7 +28,7 @@ class SimpleNet:
                 self._callback(self.transformer.deprocess("data", net_in))
         self.callback = callback
 
-    def load_model(self, model_file, pretrained_file, mean):
+    def _load_model(self, model_file, pretrained_file, mean):
         """Load specified model."""
         net = caffe.Net(model_file, pretrained_file, caffe.TEST)
 
@@ -51,9 +51,13 @@ class SimpleNet:
 
     def load_image(self, imgname):
         img = caffe.io.load_image(imgname)
+        self.input_image(img)
+
+    def input_image(self, img):
         self._rescale_net(img)
         net_in = self.transformer.preprocess("data", img)
         self.net.blobs["data"].data[0] = net_in
+
 
 
 

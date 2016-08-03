@@ -36,19 +36,23 @@ DEFAULTS = {
     "length":512,
     "ratio":1e4,
     "iters":400,
-    "styleScale":1
+    "styleScale":1,
+    "init":"-1",
+    "compMode":0
 }
 
-def transferStyleComplex(inFile, init="-1"):
+def transferStyleComplex(inFile):
     specs = readJsonInput(inFile)
 
     length = specs["length"]
     ratio = specs["ratio"]
     iters = specs["iters"]
     styleScale = specs["styleScale"]
+    init = specs["init"]
 
     ns = NeuralStyle()
 
+    ns.config(specs)
     ns.transferStyle(specs, n_iter=iters, ratio=ratio, length=length, styleScale=styleScale, init=init)
 
     img_out = ns.get_generated()
@@ -81,7 +85,12 @@ def readJsonInput(jsonFile):
             specs["style"][layer]["weight"] = 1.0 / nLayers
         if "contributions" not in specs["style"][layer]:
             n = len(specs["style"][layer]["images"])
-            specs["style"][layer]["contributions"] = [1.0/n] * n
+            if n > 0:
+                contr = [1.0/n] * n
+            else:
+                contr = 0
+            specs["style"][layer]["contributions"] = contr
+                
 
     nLayers = len(specs["content"])
     for layer in specs["content"]:
@@ -89,7 +98,11 @@ def readJsonInput(jsonFile):
             specs["content"][layer]["weight"] = 1.0 / nLayers
         if "contributions" not in specs["content"][layer]:
             n = len(specs["content"][layer]["images"])
-            specs["content"][layer]["contributions"] = [1.0/n] * n
+            if n > 0:
+                contr = [1.0/n] * n
+            else:
+                contr = 0
+            specs["content"][layer]["contributions"] = contr
 
     #load default values if not present
     for value in DEFAULTS:
@@ -98,89 +111,12 @@ def readJsonInput(jsonFile):
 
     return specs
 
-def optimizeImage(img, net, contribs, reprs, ratio):
-    """
-    Optimization function for creating the resulting image.
-    """
-
-    contrStyle = contribs["style"]
-    contrContent = contribs["content"]
-    layersStyle = contrStyle.keys()
-    layersContent = contrContent.keys()
-
-    net_in = img.reshape(net.blobs["data"].data.shape[1:])
-
-    (G_guide, F_guide) = reprs
-    (G, F) = _compute_reprs(net_in, net, layersStyle, layersContent)
-
-    #backprop by layer
-    loss = 0
-    layers = list(net.blobs)[1:]
-    net.blobs[layers[-1]].diff[:] = 0
-
-    for i, layer in enumerate(reversed(layers)):
-        nextLayer = None if i == len(layers)-1 else layers[-i-2]
-        grad = net.blobs[layer].diff[0]
-
-        #style contribution
-        if layer in layersStyle:
-            contr = contrStyle[layer]["weight"]
-            (localLoss, localGrad) = _compute_style_grad(F, G, G_guide, layer)
-            loss += contr * localLoss * ratio
-            grad += contr * localGrad.reshape(grad.shape) * ratio
-
-        #content contribution
-        if layer in layersContent:
-            contr = contrContent[layer]["weight"]
-            (localLoss, localGrad) = _compute_content_grad(F, F_guide, layer)
-            loss += contr * localLoss
-            grad += contr * localGrad.reshape(grad.shape)
-
-        #compute gradient
-        net.backward(start=layer, end=nextLayer)
-        if nextLayer is None:
-            grad = net.blobs["data"].diff[0]
-        else:
-            grad = net.blobs[nextLayer].diff[0]
-
-    #format gradient for minimize() function
-    grad = grad.flatten().astype(np.float64)
-
-    return loss, grad
-
-def _compute_style_grad(F, G, G_guide, layer):
-    """Computes style gradient and loss from activation features."""
-    (Fl, Gl) = (F[layer], G[layer])
-    c = Fl.shape[0]**-2 * Fl.shape[1]**-2
-    El = Gl - G_guide[layer]
-    loss = c/4 * (El**2).sum()
-    grad = c * sgemm(1.0, El, Fl) * (Fl>0)
-    return loss, grad
-
-def _compute_content_grad(F, F_guide, layer):
-    """Computes content gradient and loss from activation features."""
-    Fl = F[layer]
-    El = Fl - F_guide[layer]
-    loss = (El**2).sum() / 2
-    grad = El * (Fl>0)
-    return loss, grad
-
-def _compute_reprs(net_input, net, layersStyle, layersContent, gram_scale=1):
-    """Computes representation matrices for an image."""
-
-    (repr_style, repr_content) = ({}, {})
-    net.blobs["data"].data[0] = net_input
-    net.forward()
-
-    for layer in set(layersStyle)|set(layersContent):
-        F = net.blobs[layer].data[0].copy()
-        F.shape = (F.shape[0], -1)
-        repr_content[layer] = F
-        if layer in layersStyle:
-            repr_style[layer] = sgemm(gram_scale, F, F.T)
-    return repr_style, repr_content
-
 class NeuralStyle:
+
+    def input_image(self, img):
+        self._rescale_net(img)
+        net_in = self.transformer.preprocess("data", img)
+        self.net.blobs["data"].data[0] = net_in
 
     def _rescale_net(self, img):
         new_dims = (1, img.shape[2]) + img.shape[:2]
@@ -235,16 +171,6 @@ class NeuralStyle:
                 self._callback(self.transformer.deprocess("data", net_in))
         self.callback = callback
 
-    def init_weights(self, weights):
-        self.weights = weights.copy()
-
-        self.layers = []
-
-        for layer in self.net.blobs:
-            if layer in self.weights["content"] or layer in self.weights["style"]:
-                self.layers.append(layer)
-
-
     def load_model(self, model_file, pretrained_file, mean):
         """Load specified model."""
         net = caffe.Net(model_file, pretrained_file, caffe.TEST)
@@ -260,6 +186,20 @@ class NeuralStyle:
 
         self.net = net
         self.transformer = transformer
+
+    def config(self, specs):
+        self.gradientMask = {}
+        if specs["compMode"] == 1:
+            self.compMode = True
+            images = []
+            for layer in specs["style"]:
+                images += specs["style"][layer]["images"]
+            self.gradientMask, self.G_avg = self.perceptualComparison(specs["style"].keys(), images)
+        else:
+            self.compMode = False
+            for layer in specs["style"]:
+                n = self.net.blobs[layer].data[0].shape[0]
+                self.gradientMask[layer] = np.ones((n, n))
 
     def get_generated(self):
         data = self.net.blobs["data"].data
@@ -301,7 +241,7 @@ class NeuralStyle:
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
             layersStyle = [x[0] for x in imgsStyle[name]]
-            style, _ = _compute_reprs(net_in, self.net, layersStyle, [])
+            style, _ = self._compute_reprs(net_in, layersStyle, [])
             for (layer, contr) in imgsStyle[name]:
                 if layer not in reprStyle:
                     reprStyle[layer] = contr * style[layer]
@@ -321,7 +261,7 @@ class NeuralStyle:
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
             layersContent = [x[0] for x in imgsContent[name]]
-            _, content = _compute_reprs(net_in, self.net, [], layersContent)
+            _, content = self._compute_reprs(net_in, [], layersContent)
             for (layer, contr) in imgsContent[name]:
                 if layer not in reprContent:
                     reprContent[layer] = contr * content[layer]
@@ -333,18 +273,19 @@ class NeuralStyle:
     def transferStyle(self, specs, init="-1", n_iter=512,
                       ratio=1e4, length=512, callback=None, styleScale=1):
 
-        reprStyle, reprContent = self.compReprAllImgs(specs["style"], specs["content"], length, styleScale)
+        if not self.compMode:
+            reprStyle, reprContent = self.compReprAllImgs(specs["style"], specs["content"], length, styleScale)
+        else:
+            _, reprContent = self.compReprAllImgs({}, specs["content"], length, styleScale)
+            reprStyle = self.G_avg
 
         if isinstance(init, np.ndarray):
             img0 = self.transformer.preprocess("data", init)
-        elif init == "content":
-            img0 = self.transformer.preprocess("data", content_img)
-        elif init == "mixed":
-            #TODO fix name
-            img0 = 0.95*self.transformer.preprocess("data", content_img) + \
-                   0.05*self.transformer.preprocess("data", style_img)
-        else:
+        elif init == "-1":
             img0 = self._make_noise_input(init)
+        else:
+            _img = caffe.io.load_image(init)
+            img0 = self.transformer.preprocess("data", _img)
 
         # compute data bounds
         data_min = -self.transformer.mean["data"][:,0,0]
@@ -357,7 +298,7 @@ class NeuralStyle:
         optMethod = "L-BFGS-B"
         reprs = (reprStyle, reprContent)
         minfn_args = {
-            "args": (self.net, specs, reprs, ratio),
+            "args": (specs, reprs, ratio),
             "method": optMethod, "jac": True, "bounds": data_bounds,
             "options": {"maxcor": 8, "maxiter": n_iter, "disp": False}
         }
@@ -365,8 +306,123 @@ class NeuralStyle:
         #optimize
         self._callback = callback
         minfn_args["callback"] = self.callback
-        n_iters = minimize(optimizeImage, img0.flatten(), **minfn_args).nit
+        n_iters = minimize(self.optimizeImage, img0.flatten(), **minfn_args).nit
 
+    def perceptualComparison(self, layers, imNames):
+        images = []
+        for im in imNames:
+            img = caffe.io.load_image(im)
+            images.append(img)
+    
+        G_layers = {layer:[] for layer in layers}
+        for img in images:
+            self.input_image(img)
+            self.net.forward()
+            for layer in layers:
+                F = self.net.blobs[layer].data[0].copy()
+                F.shape = (F.shape[0], -1)
+                G_layers[layer].append(sgemm(1, F, F.T))
+    
+        G_avg = {layer: np.sum(G_layers[layer], axis=0)/len(G_layers[layer])
+                for layer in G_layers}
+        loss = {}
+        for layer in G_layers:
+            loss[layer] = np.sum([(G_img - G_avg[layer])**2
+                        for G_img in G_layers[layer]], axis=0)
+        indices = {}
+        for layer in loss:
+            n = loss[layer].shape[0]
+            indices[layer] = np.dstack(np.unravel_index(np.argsort(loss[layer].ravel()), (n, n)))
+            indices[layer] = indices[layer][:int(n*n*0.5)]
+        masks = {}
+        for layer in indices:
+            n = loss[layer].shape[0]
+            masks[layer] = np.zeros((n, n))
+            for ind in indices[layer][0]:
+                masks[layer][ind[0], ind[1]] = 1
+        return masks, G_avg
+
+    def optimizeImage(self, img, contribs, reprs, ratio):
+        """
+        Optimization function for creating the resulting image.
+        """
+
+        contrStyle = contribs["style"]
+        contrContent = contribs["content"]
+        layersStyle = contrStyle.keys()
+        layersContent = contrContent.keys()
+
+        net_in = img.reshape(self.net.blobs["data"].data.shape[1:])
+
+        (G_guide, F_guide) = reprs
+        (G, F) = self._compute_reprs(net_in, layersStyle, layersContent)
+
+        #backprop by layer
+        loss = 0
+        layers = list(self.net.blobs)[1:]
+        self.net.blobs[layers[-1]].diff[:] = 0
+
+        for i, layer in enumerate(reversed(layers)):
+            nextLayer = None if i == len(layers)-1 else layers[-i-2]
+            grad = self.net.blobs[layer].diff[0]
+
+            #style contribution
+            if layer in layersStyle:
+                contr = contrStyle[layer]["weight"]
+                (localLoss, localGrad) = self._compute_style_grad(F, G, G_guide, layer)
+                loss += contr * localLoss * ratio
+                grad += contr * localGrad.reshape(grad.shape) * ratio
+
+            #content contribution
+            if layer in layersContent:
+                contr = contrContent[layer]["weight"]
+                (localLoss, localGrad) = self._compute_content_grad(F, F_guide, layer)
+                loss += contr * localLoss
+                grad += contr * localGrad.reshape(grad.shape)
+
+            #compute gradient
+            self.net.backward(start=layer, end=nextLayer)
+            if nextLayer is None:
+                grad = self.net.blobs["data"].diff[0]
+            else:
+                grad = self.net.blobs[nextLayer].diff[0]
+
+        #format gradient for minimize() function
+        grad = grad.flatten().astype(np.float64)
+
+        return loss, grad
+
+    def _compute_style_grad(self, F, G, G_guide, layer):
+        """Computes style gradient and loss from activation features."""
+        (Fl, Gl) = (F[layer], G[layer])
+        c = Fl.shape[0]**-2 * Fl.shape[1]**-2
+        El = (Gl - G_guide[layer]) * self.gradientMask[layer]
+        loss = c/4 * (El**2).sum()
+        grad = c * sgemm(1.0, El, Fl) * (Fl>0)
+        return loss, grad
+
+    def _compute_content_grad(self, F, F_guide, layer):
+        """Computes content gradient and loss from activation features."""
+        Fl = F[layer]
+        El = Fl - F_guide[layer]
+        loss = (El**2).sum() / 2
+        grad = El * (Fl>0)
+        return loss, grad
+
+    def _compute_reprs(self, net_input, layersStyle, layersContent, gram_scale=1):
+        """Computes representation matrices for an image."""
+
+        (repr_style, repr_content) = ({}, {})
+        self.net.blobs["data"].data[0] = net_input
+        self.net.forward()
+
+        for layer in set(layersStyle)|set(layersContent):
+            F = self.net.blobs[layer].data[0].copy()
+            F.shape = (F.shape[0], -1)
+            repr_content[layer] = F
+            if layer in layersStyle:
+                repr_style[layer] = sgemm(gram_scale, F, F.T)
+        return repr_style, repr_content
 
 def main():
     if sys.argv[1] == "-1":
@@ -375,16 +431,8 @@ def main():
         gpu = int(sys.argv[1])
         caffe.set_device(gpu)
         caffe.set_mode_gpu()
-    n_iter = 400
-    ratio = 1e3
-    t = time.time()
     infile = sys.argv[2]
-    if len(sys.argv) > 3:
-        initImg = sys.argv[3]
-        init = caffe.io.load_image(initImg)
-    else:
-        init = "-1"
-    transferStyleComplex(infile, init=init)
+    transferStyleComplex(infile)
 
 
 if __name__ == "__main__":
