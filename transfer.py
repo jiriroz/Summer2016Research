@@ -52,12 +52,13 @@ def transferStyleComplex(inFile):
 
     ns = NeuralStyle()
 
-    ns.config(specs)
+    t = time.time()
     ns.transferStyle(specs, n_iter=iters, ratio=ratio, length=length, styleScale=styleScale, init=init)
 
     img_out = ns.get_generated()
     name = "out" + str(int(time.time())) + ".jpg"
     imsave(name, img_as_ubyte(img_out))
+    print "took " + str(int(time.time() - t)) + " s"
 
 def readJsonInput(jsonFile):
     """
@@ -165,6 +166,11 @@ class NeuralStyle:
 
         self.load_model(model_file, pretrained_file, mean)
 
+        self.gradientMask = {}
+        for layer in self.net.blobs.keys():
+            n = self.net.blobs[layer].data[0].shape[0]
+            self.gradientMask[layer] = np.ones((n, n))
+
         def callback(xk):
             if self._callback is not None:
                 net_in = xk.reshape(self.net.blobs["data"].data.shape[1:])
@@ -187,28 +193,21 @@ class NeuralStyle:
         self.net = net
         self.transformer = transformer
 
-    def config(self, specs):
-        self.gradientMask = {}
-        if specs["compMode"] == 1:
-            self.compMode = True
-            images = []
-            for layer in specs["style"]:
-                images += specs["style"][layer]["images"]
-            self.gradientMask, self.G_avg = self.perceptualComparison(specs["style"].keys(), images)
-        else:
-            self.compMode = False
-            for layer in specs["style"]:
-                n = self.net.blobs[layer].data[0].shape[0]
-                self.gradientMask[layer] = np.ones((n, n))
+    def computeTargetG(self, style):
+        images = []
+        for layer in style:
+            images += style[layer]["images"]
+        gradMask, G_avg = self.perceptualComparison(style.keys(), images)
+        for layer in gradMask:
+            self.gradientMask[layer] = gradMask[layer]
+        return G_avg
 
     def get_generated(self):
         data = self.net.blobs["data"].data
         img_out = self.transformer.deprocess("data", data)
         return img_out
 
-    def compReprAllImgs(self, specsStyle, specsContent, length, styleScale):
-        #assume the convnet input is a square
-        orig_dim = min(self.net.blobs["data"].shape[2:])
+    def compReprAllImgs(self, origDim, specsStyle, specsContent, length, styleScale):
         imgsStyle = {}
         imgsContent = {}
 
@@ -236,7 +235,7 @@ class NeuralStyle:
         for name in imgsStyle:
             img = caffe.io.load_image(name)
             scale = max(length / float(max(img.shape[:2])),
-                    orig_dim / float(min(img.shape[:2])))
+                    origDim / float(min(img.shape[:2])))
             img = rescale(img, styleScale * scale)
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
@@ -250,13 +249,14 @@ class NeuralStyle:
 
         if len(imgsContent) > 0:
             #resize everything to match the first image
+            #this will also be the size of the output
             resizeTo = imgsContent.keys()[0]
             dimContent = caffe.io.load_image(resizeTo).shape
         for name in imgsContent:
             img = caffe.io.load_image(name)
             img = resize(img, dimContent)
             scale = max(length / float(max(img.shape[:2])),
-                    orig_dim / float(min(img.shape[:2])))
+                    origDim / float(min(img.shape[:2])))
             img = rescale(img, scale)
             self._rescale_net(img)
             net_in = self.transformer.preprocess("data", img)
@@ -272,13 +272,14 @@ class NeuralStyle:
 
     def transferStyle(self, specs, init="-1", n_iter=512,
                       ratio=1e4, length=512, callback=None, styleScale=1):
-
-        if not self.compMode:
-            reprStyle, reprContent = self.compReprAllImgs(specs["style"], specs["content"], length, styleScale)
+        #assume the convnet input is a square
+        origDim = min(self.net.blobs["data"].shape[2:])
+        if specs["compMode"] != 1:
+            reprStyle, reprContent = self.compReprAllImgs(origDim, specs["style"], specs["content"], length, styleScale)
         else:
-            _, reprContent = self.compReprAllImgs({}, specs["content"], length, styleScale)
-            reprStyle = self.G_avg
-
+            reprStyle = self.computeTargetG(specs["style"])
+            _, reprContent = self.compReprAllImgs(origDim, {}, specs["content"], length, styleScale)
+        
         if isinstance(init, np.ndarray):
             img0 = self.transformer.preprocess("data", init)
         elif init == "-1":
@@ -286,7 +287,6 @@ class NeuralStyle:
         else:
             _img = caffe.io.load_image(init)
             img0 = self.transformer.preprocess("data", _img)
-
         # compute data bounds
         data_min = -self.transformer.mean["data"][:,0,0]
         data_max = data_min + self.transformer.raw_scale["data"]
@@ -313,7 +313,7 @@ class NeuralStyle:
         for im in imNames:
             img = caffe.io.load_image(im)
             images.append(img)
-    
+
         G_layers = {layer:[] for layer in layers}
         for img in images:
             self.input_image(img)
@@ -333,7 +333,7 @@ class NeuralStyle:
         for layer in loss:
             n = loss[layer].shape[0]
             indices[layer] = np.dstack(np.unravel_index(np.argsort(loss[layer].ravel()), (n, n)))
-            indices[layer] = indices[layer][:int(n*n*0.5)]
+            indices[layer] = indices[layer][:int(n*n*0.1)]
         masks = {}
         for layer in indices:
             n = loss[layer].shape[0]
@@ -360,8 +360,6 @@ class NeuralStyle:
         #backprop by layer
         loss = 0
         layers = list(self.net.blobs)[1:]
-        self.net.blobs[layers[-1]].diff[:] = 0
-
         for i, layer in enumerate(reversed(layers)):
             nextLayer = None if i == len(layers)-1 else layers[-i-2]
             grad = self.net.blobs[layer].diff[0]
