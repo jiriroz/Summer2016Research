@@ -1,6 +1,7 @@
 import os
 import sys
 
+os.environ['GLOG_minloglevel'] = '2' #suppress network init log
 import caffe
 import numpy as np
 from scipy.fftpack import ifftn
@@ -114,45 +115,6 @@ def readJsonInput(jsonFile):
 
 class NeuralStyle:
 
-    def input_image(self, img):
-        self._rescale_net(img)
-        net_in = self.transformer.preprocess("data", img)
-        self.net.blobs["data"].data[0] = net_in
-
-    def _rescale_net(self, img):
-        new_dims = (1, img.shape[2]) + img.shape[:2]
-        self.net.blobs["data"].reshape(*new_dims)
-        self.transformer.inputs["data"] = new_dims
-
-    def _make_noise_input(self, init):
-        """
-            Creates an initial input (generated) image.
-        """
-
-        # specify dimensions and create grid in Fourier domain
-        dims = tuple(self.net.blobs["data"].data.shape[2:]) + \
-               (self.net.blobs["data"].data.shape[1], )
-        grid = np.mgrid[0:dims[0], 0:dims[1]]
-
-        # create frequency representation for pink noise
-        Sf = (grid[0] - (dims[0]-1)/2.0) ** 2 + \
-             (grid[1] - (dims[1]-1)/2.0) ** 2
-        Sf[np.where(Sf == 0)] = 1
-        Sf = np.sqrt(Sf)
-        Sf = np.dstack((Sf**int(init),)*dims[2])
-
-        # apply ifft to create pink noise and normalize
-        ifft_kernel = np.cos(2*np.pi*np.random.randn(*dims)) + \
-                      1j*np.sin(2*np.pi*np.random.randn(*dims))
-        img_noise = np.abs(ifftn(Sf * ifft_kernel))
-        img_noise -= img_noise.min()
-        img_noise /= img_noise.max()
-
-        # preprocess the pink noise image
-        x0 = self.transformer.preprocess("data", img_noise)
-
-        return x0
-
     def __init__(self, model="vgg19"):
 
         if model == "vgg19":
@@ -193,19 +155,44 @@ class NeuralStyle:
         self.net = net
         self.transformer = transformer
 
-    def computeTargetG(self, style):
-        images = []
-        for layer in style:
-            images += style[layer]["images"]
-        gradMask, G_avg = self.perceptualComparison(style.keys(), images)
-        for layer in gradMask:
-            self.gradientMask[layer] = gradMask[layer]
-        return G_avg
+    def transferStyle(self, specs, init="-1", n_iter=512,
+                      ratio=1e4, length=512, callback=None, styleScale=1):
+        #assume the convnet input is a square
+        origDim = min(self.net.blobs["data"].shape[2:])
+        if specs["compMode"] != 1:
+            reprStyle, reprContent = self.compReprAllImgs(origDim, specs["style"], specs["content"], length, styleScale)
+        else:
+            reprStyle = self.computeTargetG(specs["style"])
+            _, reprContent = self.compReprAllImgs(origDim, {}, specs["content"], length, styleScale)
+        
+        if isinstance(init, np.ndarray):
+            img0 = self.transformer.preprocess("data", init)
+        elif init == "-1":
+            img0 = self._make_noise_input(init)
+        else:
+            _img = caffe.io.load_image(init)
+            img0 = self.transformer.preprocess("data", _img)
+        # compute data bounds
+        data_min = -self.transformer.mean["data"][:,0,0]
+        data_max = data_min + self.transformer.raw_scale["data"]
+        data_bounds = [(data_min[0], data_max[0])]*(img0.size/3) + \
+                      [(data_min[1], data_max[1])]*(img0.size/3) + \
+                      [(data_min[2], data_max[2])]*(img0.size/3)
 
-    def get_generated(self):
-        data = self.net.blobs["data"].data
-        img_out = self.transformer.deprocess("data", data)
-        return img_out
+        # optimization params
+        optMethod = "L-BFGS-B"
+        reprs = (reprStyle, reprContent)
+        minfn_args = {
+            "args": (specs, reprs, ratio),
+            "method": optMethod, "jac": True, "bounds": data_bounds,
+            "options": {"maxcor": 8, "maxiter": n_iter, "disp": False}
+        }
+
+        #optimize
+        self._callback = callback
+        minfn_args["callback"] = self.callback
+        n_iters = minimize(self.optimizeImage, img0.flatten(), **minfn_args).nit
+
 
     def compReprAllImgs(self, origDim, specsStyle, specsContent, length, styleScale):
         imgsStyle = {}
@@ -249,7 +236,7 @@ class NeuralStyle:
 
         if len(imgsContent) > 0:
             #resize everything to match the first image
-            #this will also be the size of the output
+            #this will also be the size of the output image
             resizeTo = imgsContent.keys()[0]
             dimContent = caffe.io.load_image(resizeTo).shape
         for name in imgsContent:
@@ -270,43 +257,14 @@ class NeuralStyle:
 
         return reprStyle, reprContent
 
-    def transferStyle(self, specs, init="-1", n_iter=512,
-                      ratio=1e4, length=512, callback=None, styleScale=1):
-        #assume the convnet input is a square
-        origDim = min(self.net.blobs["data"].shape[2:])
-        if specs["compMode"] != 1:
-            reprStyle, reprContent = self.compReprAllImgs(origDim, specs["style"], specs["content"], length, styleScale)
-        else:
-            reprStyle = self.computeTargetG(specs["style"])
-            _, reprContent = self.compReprAllImgs(origDim, {}, specs["content"], length, styleScale)
-        
-        if isinstance(init, np.ndarray):
-            img0 = self.transformer.preprocess("data", init)
-        elif init == "-1":
-            img0 = self._make_noise_input(init)
-        else:
-            _img = caffe.io.load_image(init)
-            img0 = self.transformer.preprocess("data", _img)
-        # compute data bounds
-        data_min = -self.transformer.mean["data"][:,0,0]
-        data_max = data_min + self.transformer.raw_scale["data"]
-        data_bounds = [(data_min[0], data_max[0])]*(img0.size/3) + \
-                      [(data_min[1], data_max[1])]*(img0.size/3) + \
-                      [(data_min[2], data_max[2])]*(img0.size/3)
-
-        # optimization params
-        optMethod = "L-BFGS-B"
-        reprs = (reprStyle, reprContent)
-        minfn_args = {
-            "args": (specs, reprs, ratio),
-            "method": optMethod, "jac": True, "bounds": data_bounds,
-            "options": {"maxcor": 8, "maxiter": n_iter, "disp": False}
-        }
-
-        #optimize
-        self._callback = callback
-        minfn_args["callback"] = self.callback
-        n_iters = minimize(self.optimizeImage, img0.flatten(), **minfn_args).nit
+    def computeTargetG(self, style):
+        images = []
+        for layer in style:
+            images += style[layer]["images"]
+        gradMask, G_avg = self.perceptualComparison(style.keys(), images)
+        for layer in gradMask:
+            self.gradientMask[layer] = gradMask[layer]
+        return G_avg
 
     def perceptualComparison(self, layers, imNames):
         images = []
@@ -333,14 +291,54 @@ class NeuralStyle:
         for layer in loss:
             n = loss[layer].shape[0]
             indices[layer] = np.dstack(np.unravel_index(np.argsort(loss[layer].ravel()), (n, n)))
-            indices[layer] = indices[layer][:int(n*n*0.1)]
+            indices[layer] = indices[layer][0][:int(n*n*0.05)]
         masks = {}
         for layer in indices:
             n = loss[layer].shape[0]
             masks[layer] = np.zeros((n, n))
-            for ind in indices[layer][0]:
+            for ind in indices[layer]:
                 masks[layer][ind[0], ind[1]] = 1
         return masks, G_avg
+
+    def input_image(self, img):
+        self._rescale_net(img)
+        net_in = self.transformer.preprocess("data", img)
+        self.net.blobs["data"].data[0] = net_in
+
+    def _rescale_net(self, img):
+        new_dims = (1, img.shape[2]) + img.shape[:2]
+        self.net.blobs["data"].reshape(*new_dims)
+        self.transformer.inputs["data"] = new_dims
+
+    def _make_noise_input(self, init):
+        """
+            Creates an initial input (generated) image.
+        """
+
+        # specify dimensions and create grid in Fourier domain
+        dims = tuple(self.net.blobs["data"].data.shape[2:]) + \
+               (self.net.blobs["data"].data.shape[1], )
+        grid = np.mgrid[0:dims[0], 0:dims[1]]
+
+        # create frequency representation for pink noise
+        Sf = (grid[0] - (dims[0]-1)/2.0) ** 2 + \
+             (grid[1] - (dims[1]-1)/2.0) ** 2
+        Sf[np.where(Sf == 0)] = 1
+        Sf = np.sqrt(Sf)
+        Sf = np.dstack((Sf**int(init),)*dims[2])
+
+        # apply ifft to create pink noise and normalize
+        ifft_kernel = np.cos(2*np.pi*np.random.randn(*dims)) + \
+                      1j*np.sin(2*np.pi*np.random.randn(*dims))
+        img_noise = np.abs(ifftn(Sf * ifft_kernel))
+        img_noise -= img_noise.min()
+        img_noise /= img_noise.max()
+
+        # preprocess the pink noise image
+        x0 = self.transformer.preprocess("data", img_noise)
+
+        return x0
+
 
     def optimizeImage(self, img, contribs, reprs, ratio):
         """
@@ -390,6 +388,31 @@ class NeuralStyle:
 
         return loss, grad
 
+    def _compute_reprs(self, net_input, layersStyle, layersContent, gram_scale=1):
+        """Computes representation matrices for an image."""
+
+        (repr_style, repr_content) = ({}, {})
+        self.net.blobs["data"].data[0] = net_input
+        self.net.forward()
+
+        for layer in set(layersStyle)|set(layersContent):
+            F = self.net.blobs[layer].data[0].copy()
+            F.shape = (F.shape[0], -1)
+            repr_content[layer] = F
+            if layer in layersStyle:
+                gram_scale = 1.0 / F.shape[1] #modification
+                repr_style[layer] = sgemm(gram_scale, F, F.T)
+        return repr_style, repr_content
+
+    def compute_style_grad(self, F, G, G_guide, layer):
+        """Computes style gradient and loss from activation features."""
+        (Fl, Gl) = (F[layer], G[layer])
+        c = Fl.shape[0]**-1 * Fl.shape[1]**-1 #modification
+        El = (Gl - G_guide[layer]) * self.gradientMask[layer]
+        loss = c/2 * (El**2).sum() #modification
+        grad = c * sgemm(1.0, El, Fl) * (Fl>0)
+        return loss, grad
+
     def _compute_style_grad(self, F, G, G_guide, layer):
         """Computes style gradient and loss from activation features."""
         (Fl, Gl) = (F[layer], G[layer])
@@ -407,20 +430,10 @@ class NeuralStyle:
         grad = El * (Fl>0)
         return loss, grad
 
-    def _compute_reprs(self, net_input, layersStyle, layersContent, gram_scale=1):
-        """Computes representation matrices for an image."""
-
-        (repr_style, repr_content) = ({}, {})
-        self.net.blobs["data"].data[0] = net_input
-        self.net.forward()
-
-        for layer in set(layersStyle)|set(layersContent):
-            F = self.net.blobs[layer].data[0].copy()
-            F.shape = (F.shape[0], -1)
-            repr_content[layer] = F
-            if layer in layersStyle:
-                repr_style[layer] = sgemm(gram_scale, F, F.T)
-        return repr_style, repr_content
+    def get_generated(self):
+        data = self.net.blobs["data"].data
+        img_out = self.transformer.deprocess("data", data)
+        return img_out
 
 def main():
     if sys.argv[1] == "-1":
