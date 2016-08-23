@@ -39,7 +39,8 @@ DEFAULTS = {
     "iters":400,
     "styleScale":1,
     "init":"-1",
-    "compMode":0
+    "compMode":0,
+    "phases":0
 }
 
 def transferStyleComplex(inFile):
@@ -54,12 +55,60 @@ def transferStyleComplex(inFile):
     ns = NeuralStyle()
 
     t = time.time()
-    ns.transferStyle(specs, n_iter=iters, ratio=ratio, length=length, styleScale=styleScale, init=init)
+
+    if specs["phases"] == 1:
+        transferWithPhases(ns, specs)
+    else:
+        ns.transferStyle(specs, n_iter=iters, ratio=ratio, length=length, styleScale=styleScale, init=init)
 
     img_out = ns.get_generated()
-    name = "out" + str(int(time.time())) + ".jpg"
+    if len(sys.argv) > 3:
+        name = sys.argv[3]
+    else:
+        name = "out" + str(int(time.time())) + ".jpg"
     imsave(name, img_as_ubyte(img_out))
     print "took " + str(int(time.time() - t)) + " s"
+
+def transferWithPhases(ns, specs):
+    styleSc = specs["styleScale"]
+    init = specs["init"]
+    #Experimental method for phase transfer.
+    ratios = {"conv5_4": 5e7, "conv5_3": 5e7, "conv5_2": 1e7, "conv5_1": 1e7,
+              "conv4_4": 1e4, "conv4_3": 1e4, "conv4_2": 1e4, "conv4_1": 1e4,
+              "conv3_4": 1e4, "conv3_3": 1e4, "conv3_2": 1e4, "conv3_1": 1e4,
+              "conv2_2": 1e3, "conv2_1": 1e3, "conv1_2": 1e2, "conv1_1": 1e2}
+    layers = ["conv5_4",
+              "conv5_3",
+              "conv5_2",
+              "conv5_1",
+              "conv4_4",
+              "conv4_3",
+              "conv4_2",
+              "conv4_1"
+              #"conv3_4",
+              #"conv3_3",
+              #"conv3_2",
+              #"conv3_1"
+              ]
+    styleImgs = []
+    for l in specs["style"]:
+        styleImgs += specs["style"][l]["images"]
+    styleImgs = list(set(styleImgs))
+    contribs = [1.0/len(styleImgs)] * len(styleImgs)
+    
+    iters = 50
+    for layer in layers:
+        specs["style"] = {layer:{"images":styleImgs,"weight":1, "contributions":contribs}} 
+        ns.transferStyle(specs, n_iter=iters, ratio=ratios[layer], styleScale=styleSc,init=init)
+        init = ns.get_generated()
+
+    img_out = ns.get_generated()
+    if len(sys.argv) > 3:
+        name = sys.argv[3]
+    else:
+        name = "out" + str(int(time.time())) + ".jpg"
+    imsave(name, img_as_ubyte(img_out))
+
 
 def readJsonInput(jsonFile):
     """
@@ -92,7 +141,6 @@ def readJsonInput(jsonFile):
             else:
                 contr = 0
             specs["style"][layer]["contributions"] = contr
-                
 
     nLayers = len(specs["content"])
     for layer in specs["content"]:
@@ -291,7 +339,7 @@ class NeuralStyle:
         for layer in loss:
             n = loss[layer].shape[0]
             indices[layer] = np.dstack(np.unravel_index(np.argsort(loss[layer].ravel()), (n, n)))
-            indices[layer] = indices[layer][0][:int(n*n*0.05)]
+            indices[layer] = indices[layer][0][int(n*n*0.05):]
         masks = {}
         for layer in indices:
             n = loss[layer].shape[0]
@@ -400,7 +448,6 @@ class NeuralStyle:
             F.shape = (F.shape[0], -1)
             repr_content[layer] = F
             if layer in layersStyle:
-                gram_scale = 1.0 / F.shape[1] #modification
                 repr_style[layer] = sgemm(gram_scale, F, F.T)
         return repr_style, repr_content
 

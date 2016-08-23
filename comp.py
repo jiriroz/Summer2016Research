@@ -1,22 +1,58 @@
+import os
+import sys
+import random
 import numpy as np
 from scipy.linalg.blas import sgemm
 import time
 
-IN = np.array([])
-OUT = np.array([])
+#os.environ['GLOG_minloglevel'] = '3'
+import caffe
+import numpy as np
+from simple_net import SimpleNet
+
+
+"""
+Running time: n * (feedforward time) + n*n/2 * (comparison time)
+comparison time = 0.0002 s
+
+"""
+
+def getImages(path, n):
+    """Randomly choose n images from the given directory
+    and return the list of their locations.
+    """
+    images = os.listdir(path)
+    return random.sample(images, n)
+
+def chooseImages(path, n):
+    """Path contains directories, each containing one category."""
+    categories = os.listdir(path)
+    for cat in categories:
+        catpath = path + "/" + cat
+        _catpath = path + "/_" + cat
+        os.makedirs(_catpath)
+        imgs = getImages(catpath, n)
+        for img in imgs:
+            impath = catpath + "/" + img
+            newimpath = _catpath + "/" + img
+            os.system("cp {} {}".format(impath, newimpath))
+            
 
 def computeReprs(sn, all_imgs):
     """Given a list of groups where each contains a list of image names,
     return feature representations and feature covariances of the corresponding
     images."""
+    i = 1
     groupFeatures, groupCovs = [], []
     for group in all_imgs:
+        print "Group " + str(i)
+        i += 1
         F_all = []
         cov_all = []
         for img in group:
             F = {}
             cov = {}
-            sn.load_image(img)
+            sn.load_image(img, 512)
             sn.net.forward()
             for l in sn.net.blobs.keys():
                 f = sn.getF(l)
@@ -38,31 +74,6 @@ def f(x):
     else:
         return 0.0
 infToZero = np.vectorize(f)
-
-def getGSimple(sn, img, l):
-    sn.load_image(img)
-    sn.net.forward()
-    F = sn.net.blobs[l].data[0].copy()
-    F.shape = (F.shape[0], -1)
-    return sgemm(1, F, F.T)
-
-def getG(sn, img, l):
-    sn.load_image(img)
-    sn.net.forward()
-    F = sn.net.blobs[l].data[0].copy()
-    F.shape = (F.shape[0], -1)
-    sc = 1.0/F.shape[1]
-    norm = np.apply_along_axis(np.linalg.norm, 1, F)
-    Fnorm = F / np.matrix(norm).T
-    return sgemm(sc, Fnorm, Fnorm.T)
-
-def compareNorm(sn, img1, img2, l):
-    G1 = np.log(getG(sn, img1, l))
-    G2 = np.log(getG(sn, img2, l))
-    G1 = G1 / np.sum(G1)
-    G2 = G2 / np.sum(G2)
-    n = G1.shape[0]
-    return np.sum(np.abs(G1 - G2)) / n**2
 
 def computeCov(F):
     #Compute the covariance matrix of filters given
@@ -102,9 +113,7 @@ def compareImagesGivenCovariances(l, img1, img2):
     cov2 = img2[l]
     return compareCov(cov1, cov2)
 
-def compareGroups(l, group1, group2, same):
-    global IN
-    global OUT
+def compareGroups(l, group1, group2, same, incomps, outcomps):
     n = len(group1)
     dist = np.zeros((n, n))
     avg = 0.0
@@ -115,7 +124,6 @@ def compareGroups(l, group1, group2, same):
                 continue
             if same and i == j:
                 continue
-            t = time.time()
             #d = compareImagesGivenFeatures(l, group1[i], group2[j])
             d = compareImagesGivenCovariances(l, group1[i], group2[j])
             dist[i,j] = d
@@ -123,13 +131,13 @@ def compareGroups(l, group1, group2, same):
             avg += d
             count += 1
             if same:
-                IN = np.append(IN, d)
+                incomps.append(d)
             else:
-                OUT = np.append(OUT, d)
+                outcomps.append(d)
     avg /= count
     return avg, dist
 
-def compareManyGroups(sn, layer, groupFeatures):
+def compareManyGroups(sn, layer, groupFeatures, incomps, outcomps):
     """
     @param groupFeatures list of lists where each element is a dictionary of
     feature representations for each layer for a particular image
@@ -145,7 +153,7 @@ def compareManyGroups(sn, layer, groupFeatures):
         for j in range(n):
             if j > i:
                 continue
-            avg, d = compareGroups(layer, groupFeatures[i], groupFeatures[j], i == j)
+            avg, d = compareGroups(layer, groupFeatures[i], groupFeatures[j], i == j, incomps, outcomps)
             dist[i,j] = avg
             dist[j,i] = avg
             if i == j:
@@ -158,47 +166,62 @@ def compareManyGroups(sn, layer, groupFeatures):
     inGroup /= inGroupCt
     outGroup /= outGroupCt
     np.set_printoptions(precision=4)
+
+    incomps = np.array(incomps)
+    outcomps = np.array(outcomps)
     
-    print layer
-    print "Ratio: " + str(outGroup / inGroup)
-    stdIn = np.std(IN)
-    stdOut = np.std(OUT)
-    distIn = (np.mean(OUT) - np.mean(IN)) / stdIn
-    distOut = (np.mean(OUT) - np.mean(IN)) / stdOut
-    print "In mean:", np.mean(IN)
-    print "Out mean", np.mean(OUT)
-    print "In std: ", stdIn
-    print "Normalized distance in: ", distIn
-
-    T = time.time() - t
-    n = len(IN) + len(OUT)
-    print "Complete comparison took " + str(T)
-    print "Performed " + str(n) + "comparisons."
-    print "Average comparison took " + str(T/n)
-
-    print ""
+    stdin = np.std(incomps)
+    stdout = np.std(outcomps)
+    return np.mean(incomps), stdin, np.mean(outcomps), stdout
             
-def compute():
-    import os
-    os.environ['GLOG_minloglevel'] = '3'
-    import caffe
-    caffe.set_device(3)
-    caffe.set_mode_gpu()
-    import numpy as np
-    from simple_net import SimpleNet
-    
+def train(trainDir):
     sn = SimpleNet()
-    imgs = ["dog", "cat", "hedgehog", "rabbit", "squirell", "ball"]
-    all_imgs = [["categories/" + x + str(i) + ".jpg" for i in range(1, 5)] for x in imgs]
+    categories = os.listdir(trainDir)
+    all_imgs = [map(lambda y:trainDir + "/" + x + "/" + y, os.listdir(trainDir + "/" + x)) for x in categories]
 
-    #layers = ["conv4_1", "conv4_2", "conv4_3", "conv4_4" ,"conv5_1", "conv5_2", "conv5_3", "conv5_4"]
-    layers = ["conv5_4"]
     groupFeatures, groupCovs = computeReprs(sn, all_imgs)
-    for l in layers:
-        IN = np.array([])
-        OUT = np.array([])
-        compareManyGroups(sn, l, groupCovs)
+    print "Computed representations"
+    layer = "conv5_4"
+    incomps = []
+    outcomps = []
+    meanin, stdin, meanout, stdout = compareManyGroups(sn, layer, groupCovs, incomps, outcomps)
+    return meanin, meanout
+
+def test(testDir, meanin, meanout):
+    sn = SimpleNet()
+    categories = os.listdir(testDir)
+    all_imgs = [map(lambda y:testDir + "/" + x + "/" + y, os.listdir(testDir + "/" + x)) for x in categories]
+
+    groupFeatures, groupCovs = computeReprs(sn, all_imgs)
+    print "Computed representations"
+    layer = "conv5_4"
+    incomps = []
+    outcomps = []
+    compareManyGroups(sn, layer, groupCovs, incomps, outcomps)
+    correct, wrong = evaluate(meanin, meanout, incomps, outcomps)
+    print float(correct) / (correct + wrong)
+
+def evaluate(meanin, meanout, incomps, outcomps):
+    correct = 0
+    wrong = 0
+    for res in incomps:
+        if res - meanin < meanout - res:
+            correct += 1
+        else:
+            wrong += 1
+    for res in outcomps:
+        if meanout - res < res - meanin:
+            correct += 1
+        else:
+            wrong += 1
+    return correct, wrong
+
 
 if __name__ == "__main__":
-    compute()
+    caffe.set_device(int(sys.argv[1]))
+    caffe.set_mode_gpu()
+    print "Training"
+    meanin, meanout = train(sys.argv[2])
+    print "Testing"
+    test(sys.argv[3], meanin, meanout)
 
