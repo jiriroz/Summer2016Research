@@ -49,7 +49,7 @@ class SimpleNet:
         self.net.blobs["data"].reshape(*new_dims)
         self.transformer.inputs["data"] = new_dims
 
-    def load_image(self, imgname, length, origDim=224):
+    def load_image(self, imgname, length=224, origDim=224):
         img = caffe.io.load_image(imgname)
         scale = max(length / float(max(img.shape[:2])),
                 origDim / float(min(img.shape[:2])))
@@ -65,4 +65,19 @@ class SimpleNet:
         F = self.net.blobs[l].data[0].copy()
         F.shape = (F.shape[0], -1)
         return F
+
+    def classif(self, img):
+        """
+        Classify an image.
+        Input: A square image.
+        Output: Vector of top-5 indices in synset.txt.
+        """
+        self.load_image(img)
+        self.net.forward()
+        prob = np.mean(self.net.blobs["prob"].data, axis=0)
+        #Add 1 because the classes are indexed from 0.
+        return map(lambda x:x+1, np.argsort(prob)[::-1][:5])
+
+
+
 
