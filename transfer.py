@@ -39,8 +39,6 @@ DEFAULTS = {
     "iters":400,
     "styleScale":1,
     "init":"-1",
-    "compMode":0,
-    "phases":0,
     "colorless":0
 }
 
@@ -56,10 +54,7 @@ def transferStyleComplex(inFile):
     t = time.time()
 
     ns.loadParam(specs)
-    if specs["phases"] == 1:
-        transferWithPhases(ns, specs)
-    else:
-        ns.transferStyle(specs, n_iter=iters, ratio=ratio, init=init)
+    ns.transferStyle(specs, n_iter=iters, ratio=ratio, init=init)
 
     img_out = ns.get_generated()
     if len(sys.argv) > 3:
@@ -68,46 +63,6 @@ def transferStyleComplex(inFile):
         name = "out" + str(int(time.time())) + ".jpg"
     imsave(name, img_as_ubyte(img_out))
     print "took " + str(int(time.time() - t)) + " s"
-
-def transferWithPhases(ns, specs):
-    init = specs["init"]
-    #Experimental method for phase transfer.
-    ratios = {"conv5_4": 5e7, "conv5_3": 5e7, "conv5_2": 1e7, "conv5_1": 1e7,
-              "conv4_4": 1e4, "conv4_3": 1e4, "conv4_2": 1e4, "conv4_1": 1e4,
-              "conv3_4": 1e4, "conv3_3": 1e4, "conv3_2": 1e4, "conv3_1": 1e4,
-              "conv2_2": 1e3, "conv2_1": 1e3, "conv1_2": 1e2, "conv1_1": 1e2}
-    layers = ["conv5_4",
-              "conv5_3",
-              "conv5_2",
-              "conv5_1",
-              "conv4_4",
-              "conv4_3",
-              "conv4_2",
-              "conv4_1"
-              #"conv3_4",
-              #"conv3_3",
-              #"conv3_2",
-              #"conv3_1"
-              ]
-    styleImgs = []
-    for l in specs["style"]:
-        styleImgs += specs["style"][l]["images"]
-    styleImgs = list(set(styleImgs))
-    contribs = [1.0/len(styleImgs)] * len(styleImgs)
-    
-    iters = 50
-    for layer in layers:
-        specs["style"] = {layer:{"images":styleImgs,"weight":1, "contributions":contribs}} 
-        ns.transferStyle(specs, n_iter=iters, ratio=ratios[layer], init=init)
-        init = ns.get_generated()
-
-    img_out = ns.get_generated()
-    if len(sys.argv) > 3:
-        name = sys.argv[3]
-    else:
-        name = "out" + str(int(time.time())) + ".jpg"
-    imsave(name, img_as_ubyte(img_out))
-
 
 def readJsonInput(jsonFile):
     """
@@ -211,11 +166,7 @@ class NeuralStyle:
                       ratio=1e4, callback=None):
         #assume the convnet input is a square
         origDim = min(self.net.blobs["data"].shape[2:])
-        if specs["compMode"] != 1:
-            reprStyle, reprContent = self.compReprAllImgs(origDim, specs["style"], specs["content"])
-        else:
-            reprStyle = self.computeTargetG(origDim, specs["style"])
-            _, reprContent = self.compReprAllImgs(origDim, {}, specs["content"])
+        reprStyle, reprContent = self.compReprAllImgs(origDim, specs["style"], specs["content"])
         
         if isinstance(init, np.ndarray):
             img0 = self.transformer.preprocess("data", init)
@@ -314,52 +265,6 @@ class NeuralStyle:
                     reprContent[layer] += contr * content[layer]
 
         return reprStyle, reprContent
-
-    def computeTargetG(self, origDim, style):
-        images = []
-        for layer in style:
-            images += style[layer]["images"]
-        gradMask, G_avg = self.perceptualComparison(origDim, style.keys(), images)
-        for layer in gradMask:
-            self.gradientMask[layer] = gradMask[layer]
-        return G_avg
-
-    def perceptualComparison(self, origDim, layers, imNames):
-        images = []
-        for im in imNames:
-            img = caffe.io.load_image(im)
-            scale = max(self.length / float(max(img.shape[:2])),
-                    origDim / float(min(img.shape[:2])))
-            img = rescale(img, self.styleScale * scale)
-            images.append(img)
-
-        G_layers = {layer:[] for layer in layers}
-        for img in images:
-            self.input_image(img)
-            self.net.forward()
-            for layer in layers:
-                F = self.net.blobs[layer].data[0].copy()
-                F.shape = (F.shape[0], -1)
-                G_layers[layer].append(sgemm(1, F, F.T))
-    
-        G_avg = {layer: np.sum(G_layers[layer], axis=0)/len(G_layers[layer])
-                for layer in G_layers}
-        loss = {}
-        for layer in G_layers:
-            loss[layer] = np.sum([(G_img - G_avg[layer])**2
-                        for G_img in G_layers[layer]], axis=0)
-        indices = {}
-        for layer in loss:
-            n = loss[layer].shape[0]
-            indices[layer] = np.dstack(np.unravel_index(np.argsort(loss[layer].ravel()), (n, n)))
-            indices[layer] = indices[layer][0][int(n*n*0.05):]
-        masks = {}
-        for layer in indices:
-            n = loss[layer].shape[0]
-            masks[layer] = np.zeros((n, n))
-            for ind in indices[layer]:
-                masks[layer][ind[0], ind[1]] = 1
-        return masks, G_avg
 
     def input_image(self, img):
         self._rescale_net(img)
