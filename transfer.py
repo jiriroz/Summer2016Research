@@ -3,6 +3,7 @@ import sys
 
 os.environ['GLOG_minloglevel'] = '2' #suppress network init log
 import caffe
+import math
 import numpy as np
 from scipy.fftpack import ifftn
 from scipy.linalg.blas import sgemm
@@ -39,7 +40,8 @@ DEFAULTS = {
     "iters":400,
     "styleScale":1,
     "init":"-1",
-    "colorless":0
+    "colorless":0,
+    "maxClass":-1
 }
 
 def transferStyleComplex(inFile):
@@ -145,6 +147,7 @@ class NeuralStyle:
         self.styleScale = specs["styleScale"]
         self.length = specs["length"]
         self.colorless = specs["colorless"] == 1
+        self.maxClass = specs["maxClass"]
 
     def load_model(self, model_file, pretrained_file, mean):
         """Load specified model."""
@@ -327,6 +330,11 @@ class NeuralStyle:
             nextLayer = None if i == len(layers)-1 else layers[-i-2]
             grad = self.net.blobs[layer].diff[0]
 
+            if layer == "prob" and self.maxClass != -1:
+                (localLoss, localGrad) = self.crossEntropyLoss()
+                loss += localLoss * 1.0
+                grad += localGrad * 1.0
+
             #style contribution
             if layer in layersStyle:
                 contr = contrStyle[layer]["weight"]
@@ -351,6 +359,15 @@ class NeuralStyle:
         #format gradient for minimize() function
         grad = grad.flatten().astype(np.float64)
 
+        return loss, grad
+
+    def crossEntropyLoss(self):
+        p = self.net.blobs["prob"].data[0]
+        fc8 = self.net.blobs["fc8"].data[0]
+        k = self.maxClass
+        loss = -math.log(p[k])
+        grad = - np.e ** (fc8 + fc8[k]) / np.sum(fc8)
+        grad[k] = p[k] * (1 - p[k])
         return loss, grad
 
     def _compute_reprs(self, net_input, layersStyle, layersContent, gram_scale=1):

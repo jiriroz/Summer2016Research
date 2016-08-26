@@ -66,7 +66,7 @@ class SimpleNet:
         F.shape = (F.shape[0], -1)
         return F
 
-    def classif(self, img):
+    def classify(self, img):
         """
         Classify an image.
         Input: A square image.
@@ -74,7 +74,7 @@ class SimpleNet:
         """
         self.load_image(img)
         self.net.forward()
-        prob = np.mean(self.net.blobs["prob"].data, axis=0)
+        prob = self.net.blobs["prob"].data[0]
         #Add 1 because the classes are indexed from 0.
         return map(lambda x:x+1, np.argsort(prob)[::-1][:5])
 
