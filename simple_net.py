@@ -61,6 +61,11 @@ class SimpleNet:
         net_in = self.transformer.preprocess("data", img)
         self.net.blobs["data"].data[0] = net_in
 
+    def get_generated(self):
+        data = self.net.blobs["data"].data
+        img_out = self.transformer.deprocess("data", data)
+        return img_out
+
     def getF(self, l):
         F = self.net.blobs[l].data[0].copy()
         F.shape = (F.shape[0], -1)

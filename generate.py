@@ -63,7 +63,10 @@ def transferStyleComplex(inFile):
         name = sys.argv[3]
     else:
         name = "out" + str(int(time.time())) + ".jpg"
+    print np.min(ns.net.blobs["data"].data[0]), np.max(ns.net.blobs["data"].data[0])
+    print np.min(img_out), np.max(img_out)
     imsave(name, img_as_ubyte(img_out))
+    print str(ns.it) + " iterations"
     print "took " + str(int(time.time() - t)) + " s"
 
 def readJsonInput(jsonFile):
@@ -122,7 +125,7 @@ class NeuralStyle:
     def __init__(self, model="vgg19"):
 
         if model == "vgg19":
-            model_file = "models/vgg19/_VGG_ILSVRC_19_layers_deploy.prototxt"
+            model_file = "models/vgg19/VGG_ILSVRC_19_layers_deploy.prototxt"
             pretrained_file = "models/vgg19/VGG_ILSVRC_19_layers.caffemodel"
             mean = np.array([103.939, 116.779, 123.68])
         else:
@@ -175,7 +178,8 @@ class NeuralStyle:
         if isinstance(init, np.ndarray):
             img0 = self.transformer.preprocess("data", init)
         elif init == "-1":
-            img0 = self._make_noise_input(init)
+            #img0 = self._make_noise_input(init)
+            img0 = self._make_gaussian_input()
         else:
             _img = caffe.io.load_image(init)
             img0 = self.transformer.preprocess("data", _img)
@@ -198,7 +202,8 @@ class NeuralStyle:
         #optimize
         self._callback = callback
         minfn_args["callback"] = self.callback
-        n_iters = minimize(self.optimizeImage, img0.flatten(), **minfn_args).nit
+        #n_iters = minimize(self.optimizeImage, img0.flatten(), **minfn_args).nit
+        self.gradientDescent(img0.flatten(), n_iter, np.array(data_bounds), (specs, reprs, ratio))
 
     def compReprAllImgs(self, origDim, specsStyle, specsContent):
         imgsStyle = {}
@@ -307,6 +312,28 @@ class NeuralStyle:
         x0 = self.transformer.preprocess("data", img_noise)
         return x0
 
+    def _make_gaussian_input(self):
+        dims = (3,) + self.net.blobs["data"].data.shape[2:]
+        grid = np.random.randn(*dims)
+        #grid = np.clip(grid, 0, 1)
+        #grid = self.transformer.preprocess("data", grid)
+        return grid
+
+    def gradientDescent(self, init, iters, dataBounds, minfnArgs):
+        """Simple gradient descent"""
+        prevLoss = 0
+        img = init
+        stepSize = 1e11
+        for i in range(iters):
+            #step
+            loss, grad = self.optimizeImage(img, *minfnArgs)
+            step = np.clip(stepSize * grad, -1, 1)
+            img = img + step
+            img = np.clip(img, np.min(dataBounds), np.max(dataBounds))
+            if abs(loss - prevLoss) < 0.00001:
+                break
+            prevLoss = loss
+            
     def optimizeImage(self, img, contribs, reprs, ratio):
         """
         Optimization function for creating the resulting image.
@@ -329,6 +356,11 @@ class NeuralStyle:
             nextLayer = None if i == len(layers)-1 else layers[-i-2]
             grad = self.net.blobs[layer].diff[0]
 
+            if layer == "prob" and self.maxClass != -1:
+                (localLoss, localGrad) = self.crossEntropyLoss()
+                loss += localLoss * 1e4
+                grad += localGrad * 1e10
+
             #style contribution
             if layer in layersStyle:
                 contr = contrStyle[layer]["weight"]
@@ -350,8 +382,33 @@ class NeuralStyle:
             else:
                 grad = self.net.blobs[nextLayer].diff[0]
 
+        #img_out = self.get_generated()
+        #name = "_" + str(self.it) + ".jpg"
+        #imsave(name, img_as_ubyte(img_out))
+
+        #print "data sample", self.net.blobs["data"].data[0][0,55,55]
+        #print "grad sample", grad[0,55,55]
         #format gradient for minimize() function
         grad = grad.flatten().astype(np.float64)
+        print "loss", loss
+        print "data mean", np.mean(self.net.blobs["data"].data[0]), "grad mean", np.mean(grad)
+        print "p: " + str(self.net.blobs["prob"].data[0][self.maxClass])
+        self.it += 1
+        print self.it
+        #print ""
+        #print ""
+
+        return loss, grad
+
+    def crossEntropyLoss(self):
+        p = self.net.blobs["prob"].data[0]
+        fc8 = self.net.blobs["fc8"].data[0]
+        k = self.maxClass
+        loss = -math.log(p[k])
+        #grad = - np.e ** (fc8 + fc8[k]) / np.sum(fc8)
+        grad = np.zeros(p.shape, dtype=np.float32)
+        #grad[k] = p[k] * (1 - p[k])
+        grad[k] = 1
         return loss, grad
 
     def _compute_reprs(self, net_input, layersStyle, layersContent, gram_scale=1):
