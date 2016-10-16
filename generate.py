@@ -14,6 +14,7 @@ from skimage.transform import rescale
 from skimage.transform import resize
 import time
 import json
+import cv2
 
 VGG_LAYERS = [
 "conv1_1",
@@ -51,7 +52,7 @@ def transferStyleComplex(inFile):
     iters = specs["iters"]
     init = specs["init"]
 
-    ns = NeuralStyle()
+    ns = NeuralStyle(model="caffenet")
 
     t = time.time()
 
@@ -63,11 +64,10 @@ def transferStyleComplex(inFile):
         name = sys.argv[3]
     else:
         name = "out" + str(int(time.time())) + ".jpg"
-    print np.min(ns.net.blobs["data"].data[0]), np.max(ns.net.blobs["data"].data[0])
-    print np.min(img_out), np.max(img_out)
     imsave(name, img_as_ubyte(img_out))
-    print str(ns.it) + " iterations"
-    print "took " + str(int(time.time() - t)) + " s"
+    print name
+    #print str(ns.it) + " iterations"
+    #print "took " + str(int(time.time() - t)) + " s"
 
 def readJsonInput(jsonFile):
     """
@@ -128,10 +128,15 @@ class NeuralStyle:
             model_file = "models/vgg19/VGG_ILSVRC_19_layers_deploy.prototxt"
             pretrained_file = "models/vgg19/VGG_ILSVRC_19_layers.caffemodel"
             mean = np.array([103.939, 116.779, 123.68])
-        else:
+        elif model == "googlenet":
             model_file = "models/googlenet/deploy.prototxt"
             pretrained_file = "models/googlenet/googlenet_style.caffemodel"
             mean = "models/googlenet/ilsvrc_2012_mean.npy"
+        elif model == "caffenet":
+            model_file = "models/caffenet/caffenet.prototxt"
+            pretrained_file = "models/caffenet/bvlc_reference_caffenet.caffemodel"
+            mean = np.array([103.939, 116.779, 123.68])
+
 
         self.load_model(model_file, pretrained_file, mean)
 
@@ -150,7 +155,7 @@ class NeuralStyle:
         self.styleScale = specs["styleScale"]
         self.length = specs["length"]
         self.colorless = specs["colorless"] == 1
-        self.maxClass = specs["maxClass"]
+        self.maxClass = int(specs["maxClass"])
         self.it = 0
 
     def load_model(self, model_file, pretrained_file, mean):
@@ -323,18 +328,30 @@ class NeuralStyle:
         """Simple gradient descent"""
         prevLoss = 0
         img = init
-        stepSize = 1e11
+        stepSize = 1e1
+        gradClip = 8.0
+        gradScale = 2.0
+        weightDecay = 0.99
         for i in range(iters):
             #step
             loss, grad = self.optimizeImage(img, *minfnArgs)
-            step = np.clip(stepSize * grad, -1, 1)
-            img = img + step
+            step = np.clip(stepSize * grad, -gradClip, gradClip)
+            step = step / gradScale
+            #print "Step mean: ", np.mean(step)
+            img = img - step
+            img = img * weightDecay
+            #img = cv2.GaussianBlur(img, (5,5), 0)
+            #img = np.array(img[:,0])
             img = np.clip(img, np.min(dataBounds), np.max(dataBounds))
             if abs(loss - prevLoss) < 0.00001:
+                print "breaking"
                 break
             prevLoss = loss
             
     def optimizeImage(self, img, contribs, reprs, ratio):
+
+        unit = self.maxClass
+
         """
         Optimization function for creating the resulting image.
         """
@@ -343,6 +360,7 @@ class NeuralStyle:
         contrContent = contribs["content"]
         layersStyle = contrStyle.keys()
         layersContent = contrContent.keys()
+        layersFC = ["fc8", "fc8_oxford_102"]
 
         net_in = img.reshape(self.net.blobs["data"].data.shape[1:])
 
@@ -356,11 +374,6 @@ class NeuralStyle:
             nextLayer = None if i == len(layers)-1 else layers[-i-2]
             grad = self.net.blobs[layer].diff[0]
 
-            if layer == "prob" and self.maxClass != -1:
-                (localLoss, localGrad) = self.crossEntropyLoss()
-                loss += localLoss * 1e4
-                grad += localGrad * 1e10
-
             #style contribution
             if layer in layersStyle:
                 contr = contrStyle[layer]["weight"]
@@ -373,7 +386,20 @@ class NeuralStyle:
                 contr = contrContent[layer]["weight"]
                 (localLoss, localGrad) = self._compute_content_grad(F, F_guide, layer)
                 loss += contr * localLoss
+                added = np.linalg.norm(contr * localGrad.reshape(grad.shape))
+                current = np.linalg.norm(grad)
+                print "added grad / current grad", added / current
+                print "added grad", added
                 grad += contr * localGrad.reshape(grad.shape)
+
+            if layer in layersFC and unit != -1:
+                contr = 1e8
+                grad[unit] = -1.0 * contr
+                localLoss = -1.0 * contr
+                loss += localLoss
+                #TODO: Regularization on the image (necessary?)
+                #Use caffenet
+
 
             #compute gradient
             self.net.backward(start=layer, end=nextLayer)
@@ -382,17 +408,14 @@ class NeuralStyle:
             else:
                 grad = self.net.blobs[nextLayer].diff[0]
 
-        #img_out = self.get_generated()
-        #name = "_" + str(self.it) + ".jpg"
-        #imsave(name, img_as_ubyte(img_out))
+        #if self.it % 5 == 0:
+        #    img_out = self.get_generated()
+        #    name = "generation/" + str(self.it) + ".jpg"
+        #    imsave(name, img_as_ubyte(img_out))
 
-        #print "data sample", self.net.blobs["data"].data[0][0,55,55]
-        #print "grad sample", grad[0,55,55]
-        #format gradient for minimize() function
         grad = grad.flatten().astype(np.float64)
-        print "loss", loss
-        print "data mean", np.mean(self.net.blobs["data"].data[0]), "grad mean", np.mean(grad)
-        print "p: " + str(self.net.blobs["prob"].data[0][self.maxClass])
+        print "loss", loss, "grad norm", np.linalg.norm(grad)
+        print "max class", self.net.blobs["prob"].data[0][unit]
         self.it += 1
         print self.it
         #print ""
@@ -408,15 +431,15 @@ class NeuralStyle:
         #grad = - np.e ** (fc8 + fc8[k]) / np.sum(fc8)
         grad = np.zeros(p.shape, dtype=np.float32)
         #grad[k] = p[k] * (1 - p[k])
-        grad[k] = 1
+        grad[k] = -1
         return loss, grad
 
-    def _compute_reprs(self, net_input, layersStyle, layersContent, gram_scale=1):
+    def _compute_reprs(self, net_in, layersStyle, layersContent, gram_scale=1):
         """Computes representation matrices for an image."""
+        self.net.blobs["data"].data[0] = net_in
+        self.net.forward()
 
         (repr_style, repr_content) = ({}, {})
-        self.net.blobs["data"].data[0] = net_input
-        self.net.forward()
 
         for layer in set(layersStyle)|set(layersContent):
             F = self.net.blobs[layer].data[0].copy()
