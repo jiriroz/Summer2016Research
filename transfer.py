@@ -1,3 +1,8 @@
+"""
+Parts of this script were taken from https://github.com/fzliu/style-transfer
+@author Jiri Roznovjak
+"""
+
 import os
 import sys
 
@@ -342,6 +347,11 @@ class NeuralStyle:
                 (localLoss, localGrad) = self._compute_content_grad(F, F_guide, layer)
                 loss += contr * localLoss
                 grad += contr * localGrad.reshape(grad.shape)
+
+            if layer in layersFC:
+                contr = 1.0
+                unit = 0
+                
 
             #compute gradient
             self.net.backward(start=layer, end=nextLayer)
